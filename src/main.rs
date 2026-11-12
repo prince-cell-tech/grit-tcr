@@ -1,18 +1,18 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io::stdout;
 use std::process::Command;
-use std::{fs, io, time::Duration};
-use tui::layout::{Constraint, Direction, Layout};
-use tui::style::{Color, Modifier, Style};
-use tui::text::{Span, Spans};
-use tui::widgets::{Block, Borders, List, ListItem, Paragraph};
-use tui::{Terminal, backend::CrosstermBackend};
+use std::{fs, io, time::{Duration, Instant}};
 
 // ─── Data types ──────────────────────────────────────────────────────────────
 
@@ -116,7 +116,7 @@ fn parse_due_date(input: &str) -> (String, Option<String>) {
     let mut due = None;
     let mut rest = String::new();
     for word in input.split_whitespace() {
-        if word.starts_with("due:") {
+        if word.starts_with("due:") && is_valid_date(&word[4..]) {
             due = Some(word[4..].to_string());
         } else {
             if !rest.is_empty() { rest.push(' '); }
@@ -124,6 +124,22 @@ fn parse_due_date(input: &str) -> (String, Option<String>) {
         }
     }
     (rest, due)
+}
+
+// Strict YYYY-MM-DD check so overdue comparisons and date sorting stay meaningful.
+// Invalid dates stay part of the description instead of becoming metadata.
+fn is_valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let all_digits = |r: &[u8]| r.iter().all(|c| c.is_ascii_digit());
+    if !(all_digits(&b[0..4]) && all_digits(&b[5..7]) && all_digits(&b[8..10])) {
+        return false;
+    }
+    let month: u32 = s[5..7].parse().unwrap_or(0);
+    let day: u32 = s[8..10].parse().unwrap_or(0);
+    (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 fn parse_priority(input: &str) -> (String, Priority) {
@@ -144,17 +160,32 @@ fn parse_priority(input: &str) -> (String, Priority) {
 }
 
 fn current_date() -> String {
-    // Simple: use `date` command
-    Command::new("date")
-        .arg("+%Y-%m-%d")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+    // UTC date from the system clock — no subprocess needed.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn is_overdue(due: &str) -> bool {
-    let today = current_date();
-    due < today.as_str()
+// Days since 1970-01-01 -> (year, month, day) in UTC.
+// Howard Hinnant's civil_from_days algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+fn is_overdue(due: &str, today: &str) -> bool {
+    due < today
 }
 
 // ─── Undo ─────────────────────────────────────────────────────────────────────
@@ -163,6 +194,8 @@ fn is_overdue(due: &str) -> bool {
 struct Snapshot {
     tasks: Vec<Task>,
     selected: usize,
+    focused: FocusedRow,
+    scroll_offset: usize,
 }
 
 // ─── Sort ─────────────────────────────────────────────────────────────────────
@@ -304,14 +337,10 @@ fn load_tasks_from(path: &str) -> Vec<Task> {
     tasks
 }
 
-fn save_tasks(tasks: &[Task]) {
-    save_tasks_to(tasks, TASKS_FILE);
-}
-
-fn save_tasks_to(tasks: &[Task], path: &str) {
+fn save_tasks_to(tasks: &[Task], path: &str) -> io::Result<()> {
     // Don't create the file if it doesn't exist yet and there's nothing to save
     if tasks.is_empty() && !std::path::Path::new(path).exists() {
-        return;
+        return Ok(());
     }
     let mut content = String::from("# 📋 Task List\n\n");
 
@@ -349,22 +378,26 @@ fn save_tasks_to(tasks: &[Task], path: &str) {
         content.push('\n');
     }
 
-    fs::write(path, content).expect("Failed to write file");
+    fs::write(path, content)?;
+    Ok(())
 }
 
-fn export_to_json(tasks: &[Task]) {
-    let json = serde_json::to_string_pretty(tasks).expect("Failed to serialize tasks");
-    fs::write("tasks.json", json).expect("Failed to write JSON file");
+fn export_to_json(tasks: &[Task], path: &str) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(tasks)
+        .map_err(io::Error::other)?;
+    fs::write(path, json)?;
+    Ok(())
 }
 
 fn run_test_command(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() { return false; }
-    Command::new(parts[0])
-        .args(&parts[1..])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let command = command.trim();
+    if command.is_empty() { return false; }
+    // Run through a shell so test commands can use `&&`, pipes, quotes, etc.
+    #[cfg(unix)]
+    let status = Command::new("sh").arg("-c").arg(command).status();
+    #[cfg(windows)]
+    let status = Command::new("cmd").args(["/C"]).arg(command).status();
+    status.map(|s| s.success()).unwrap_or(false)
 }
 
 fn commit_tasks(message: &str) -> Result<(), String> {
@@ -377,6 +410,16 @@ fn commit_tasks(message: &str) -> Result<(), String> {
     }
     let add = Command::new("git").args(["add", "-A"]).status().map_err(|e| e.to_string())?;
     if !add.success() { return Err("git add failed".to_string()); }
+    // Keep the task-manager's own files out of commits — only code changes belong in them.
+    let mut reset_args: Vec<&str> = vec!["reset", "-q", "--"];
+    for p in [TASKS_FILE, "tasks.json", PROJECTS_DIR] {
+        if std::path::Path::new(p).exists() {
+            reset_args.push(p);
+        }
+    }
+    if reset_args.len() > 3 {
+        let _ = Command::new("git").args(&reset_args).status();
+    }
     let commit = Command::new("git").args(["commit", "-m", message]).status().map_err(|e| e.to_string())?;
     if !commit.success() { return Err("git commit failed".to_string()); }
     Ok(())
@@ -415,7 +458,14 @@ fn list_projects() -> Vec<String> {
         .unwrap_or_default()
 }
 
-// ─── App state ────────────────────────────────────────────────────────────────
+// Reject anything that could escape the projects/ directory or break the filename.
+fn is_valid_project_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+}
 
 #[derive(Debug, PartialEq, Clone)]
 enum Mode {
@@ -454,6 +504,9 @@ struct App {
     projects: Vec<String>,
     commit_msg_buf: String,
     status_msg: String,        // ephemeral bottom message
+    // Subprocess output is cached so rendering doesn't spawn git commands every frame.
+    branch_cache: (String, Instant),
+    git_log_cache: (Vec<String>, Instant),
 }
 
 impl App {
@@ -466,7 +519,7 @@ impl App {
             scroll_offset: 0,
             mode: Mode::View,
             input: String::new(),
-            test_command: String::from(" "),
+            test_command: String::new(),
             undo_stack: vec![],
             sort_mode: SortMode::None,
             search_query: String::new(),
@@ -475,6 +528,8 @@ impl App {
             projects: list_projects(),
             commit_msg_buf: String::new(),
             status_msg: String::new(),
+            branch_cache: (git_branch(), Instant::now()),
+            git_log_cache: (git_log(4), Instant::now()),
         }
     }
 
@@ -482,6 +537,8 @@ impl App {
         self.undo_stack.push(Snapshot {
             tasks: self.tasks.clone(),
             selected: self.selected,
+            focused: self.focused.clone(),
+            scroll_offset: self.scroll_offset,
         });
         if self.undo_stack.len() > 50 {
             self.undo_stack.remove(0);
@@ -492,6 +549,8 @@ impl App {
         if let Some(snap) = self.undo_stack.pop() {
             self.tasks = snap.tasks;
             self.selected = snap.selected;
+            self.focused = snap.focused;
+            self.scroll_offset = snap.scroll_offset;
             self.save();
             self.status_msg = "Undone.".to_string();
         } else {
@@ -499,16 +558,23 @@ impl App {
         }
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
         let path = if self.current_project.is_empty() {
             TASKS_FILE.to_string()
         } else {
             format!("{}/{}.md", PROJECTS_DIR, self.current_project)
         };
-        save_tasks_to(&self.tasks, &path);
+        if let Err(e) = save_tasks_to(&self.tasks, &path) {
+            self.status_msg = format!("Save failed: {e}");
+        }
     }
 
     fn load_project(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && !is_valid_project_name(name) {
+            self.status_msg = format!("Invalid project name: {name}");
+            return;
+        }
         self.current_project = name.to_string();
         let path = if name.is_empty() {
             TASKS_FILE.to_string()
@@ -615,6 +681,26 @@ impl App {
         let done = self.tasks.iter().filter(|t| t.status == Status::Done).count();
         (pending, working, done)
     }
+
+    // Git output is only refreshed every couple of seconds instead of every frame.
+    fn cached_branch(&mut self) -> String {
+        if self.branch_cache.1.elapsed() >= Duration::from_secs(2) {
+            self.branch_cache = (git_branch(), Instant::now());
+        }
+        self.branch_cache.0.clone()
+    }
+
+    fn cached_git_log(&mut self) -> Vec<String> {
+        if self.git_log_cache.1.elapsed() >= Duration::from_secs(2) {
+            self.git_log_cache = (git_log(4), Instant::now());
+        }
+        self.git_log_cache.0.clone()
+    }
+
+    fn invalidate_git_caches(&mut self) {
+        self.branch_cache = (git_branch(), Instant::now());
+        self.git_log_cache = (git_log(4), Instant::now());
+    }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -645,18 +731,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
 
     loop {
         terminal.draw(|f| {
-            let size = f.size();
-
-            // Adjust scroll so selected row stays visible
-            let vis = app.visible_indices();
-            let flat_row = app.focused_to_row_index(&vis);
-            let list_height = size.height.saturating_sub(9) as usize;
-            if flat_row >= app.scroll_offset + list_height {
-                app.scroll_offset = flat_row + 1 - list_height;
-            }
-            if flat_row < app.scroll_offset {
-                app.scroll_offset = flat_row;
-            }
+            let size = f.area();
 
             // Layout: header | task list | [git log] | input | status bar
             let git_log_height = if app.show_git_log { 6u16 } else { 0 };
@@ -664,6 +739,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                 Mode::Input | Mode::Edit | Mode::EditSubtask | Mode::Test | Mode::Search | Mode::Subtask | Mode::CommitMsg => 3,
                 _ => 0,
             };
+
+            // Adjust scroll so selected row stays visible.
+            // The list area accounts for the margin, header, status bar and any open panels.
+            let vis = app.visible_indices();
+            let flat_row = app.focused_to_row_index(&vis);
+            let list_height = size.height.saturating_sub(5 + git_log_height + input_height) as usize;
+            if flat_row >= app.scroll_offset + list_height {
+                app.scroll_offset = flat_row + 1 - list_height;
+            }
+            if flat_row < app.scroll_offset {
+                app.scroll_offset = flat_row;
+            }
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -679,7 +766,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
 
             // ── Header ──
             let (pending, working, done) = app.task_counts();
-            let branch = git_branch();
+            let branch = app.cached_branch();
             let proj_label = if app.current_project.is_empty() { "default".to_string() } else { app.current_project.clone() };
             let sort_label = app.sort_mode.label();
             let header_text = format!(
@@ -693,35 +780,35 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
             // ── Help overlay ──
             if app.mode == Mode::Help {
                 let help_lines = vec![
-                    Spans::from(Span::styled(" Navigation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" j/↓  move down          k/↑  move up"),
-                    Spans::from(" Enter toggle status      d    delete task"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" Task management", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" a    add task            e    edit task / subtask"),
-                    Spans::from(" s    add subtask         u    undo"),
-                    Spans::from(" p    cycle priority      d    delete task / subtask"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" Subtasks", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" j/k  navigate into subtasks (they appear below their task)"),
-                    Spans::from(" Enter toggle subtask [ ] / [x]   e  edit subtask text"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" View / filter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" /    search              Esc  clear search"),
-                    Spans::from(" S    cycle sort           g    toggle git log"),
-                    Spans::from(" P    switch project"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" TCR / git", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" T    set test command    t    run test+commit"),
-                    Spans::from(" c    custom commit msg"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" Export / quit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Spans::from(" E    export to JSON      q    quit"),
-                    Spans::from(" ?    toggle this help"),
-                    Spans::from(""),
-                    Spans::from(Span::styled(" Task syntax when adding/editing:", Style::default().fg(Color::Cyan))),
-                    Spans::from("  #tag  due:YYYY-MM-DD  p:high / p:medium / p:low"),
-                    Spans::from("  Example: Fix login bug #bug due:2025-06-01 p:high"),
+                    Line::from(Span::styled(" Navigation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" j/↓  move down          k/↑  move up"),
+                    Line::from(" Enter toggle status      d    delete task"),
+                    Line::from(""),
+                    Line::from(Span::styled(" Task management", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" a    add task            e    edit task / subtask"),
+                    Line::from(" s    add subtask         u    undo"),
+                    Line::from(" p    cycle priority      d    delete task / subtask"),
+                    Line::from(""),
+                    Line::from(Span::styled(" Subtasks", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" j/k  navigate into subtasks (they appear below their task)"),
+                    Line::from(" Enter toggle subtask [ ] / [x]   e  edit subtask text"),
+                    Line::from(""),
+                    Line::from(Span::styled(" View / filter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" /    search              Esc  clear search"),
+                    Line::from(" S    cycle sort           g    toggle git log"),
+                    Line::from(" P    switch project"),
+                    Line::from(""),
+                    Line::from(Span::styled(" TCR / git", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" T    set test command    t    run test+commit"),
+                    Line::from(" c    custom commit msg"),
+                    Line::from(""),
+                    Line::from(Span::styled(" Export / quit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" E    export to JSON      q    quit"),
+                    Line::from(" ?    toggle this help"),
+                    Line::from(""),
+                    Line::from(Span::styled(" Task syntax when adding/editing:", Style::default().fg(Color::Cyan))),
+                    Line::from("  #tag  due:YYYY-MM-DD  p:high / p:medium / p:low"),
+                    Line::from("  Example: Fix login bug #bug due:2025-06-01 p:high"),
                 ];
                 let help = Paragraph::new(help_lines)
                     .block(Block::default().title("Help (? to close)").borders(Borders::ALL))
@@ -736,6 +823,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                 };
 
                 let task_items: Vec<ListItem> = {
+                    let today = current_date();
                     let mut items: Vec<ListItem> = vec![];
                     for (display_i, &real_i) in vis.iter().enumerate() {
                         let task = &app.tasks[real_i];
@@ -748,7 +836,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                         let tags_str: String = task.tags.iter().map(|t| format!(" #{}", t)).collect();
                         let due_str = task.due_date.as_deref().map(|d| format!(" due:{}", d)).unwrap_or_default();
 
-                        let overdue = task.due_date.as_deref().map(|d| is_overdue(d)).unwrap_or(false)
+                        let overdue = task.due_date.as_deref().map(|d| is_overdue(d, &today)).unwrap_or(false)
                             && task.status != Status::Done;
 
                         let task_selected = app.focused == FocusedRow::Task(display_i);
@@ -779,7 +867,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                             ));
                         }
 
-                        items.push(ListItem::new(Spans::from(spans)));
+                        items.push(ListItem::new(Line::from(spans)));
 
                         // Render each subtask as its own row
                         for (si, sub) in task.subtasks.iter().enumerate() {
@@ -800,7 +888,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                                 Span::styled(format!("    {} {} ", connector, marker), Style::default().fg(Color::DarkGray)),
                                 Span::styled(sub.description.clone(), sub_base),
                             ];
-                            items.push(ListItem::new(Spans::from(sub_spans)));
+                            items.push(ListItem::new(Line::from(sub_spans)));
                         }
                     }
                     items
@@ -813,8 +901,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
 
             // ── Git log panel ──
             if app.show_git_log && git_log_height > 0 {
-                let log_entries = git_log(4);
-                let log_lines: Vec<Spans> = log_entries.iter().map(|l| Spans::from(l.as_str())).collect();
+                let log_entries = app.cached_git_log();
+                let log_lines: Vec<Line> = log_entries.iter().map(|l| Line::from(l.as_str())).collect();
                 let log_widget = Paragraph::new(log_lines)
                     .block(Block::default().title("Recent commits (g to toggle)").borders(Borders::ALL))
                     .style(Style::default().fg(Color::DarkGray));
@@ -850,14 +938,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
             let status_bar = Paragraph::new(status_text.as_str())
                 .style(Style::default().fg(Color::DarkGray));
             f.render_widget(status_bar, chunks[4]);
-
-            let _vis_len = vis.len(); // keep vis alive
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Ignore key-release events (some terminals send them)
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
                 // Clear ephemeral status on any key
                 app.status_msg.clear();
+
+                // Ctrl+C always quits, from any mode
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    break;
+                }
 
                 match &app.mode.clone() {
                     Mode::View => {
@@ -956,30 +1052,37 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                                 app.mode = Mode::Test;
                             }
                             (_, KeyCode::Char('t')) => {
-                                disable_raw_mode()?;
-                                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-                                let passed = run_test_command(&app.test_command);
-                                if passed {
-                                    app.save();
-                                    let msg = if let FocusedRow::Task(di) = &app.focused {
-                                        if let Some(&real) = vis.get(*di) {
-                                            format!("TCR: completed task \"{}\"", app.tasks[real].description)
-                                        } else { "TCR: tests passed".to_string() }
-                                    } else { "TCR: tests passed".to_string() };
-                                    match commit_tasks(&msg) {
-                                        Ok(_) => println!("Committed: {}", msg),
-                                        Err(e) => println!("Not committed: {}", e),
-                                    }
+                                if app.test_command.trim().is_empty() {
+                                    // Never treat a missing command as a failing test —
+                                    // that used to trigger `git restore .` and wipe the tree.
+                                    app.status_msg = "No test command set. Press T to set one first.".to_string();
                                 } else {
-                                    println!("Tests failed, reverting...");
-                                    let _ = Command::new("git").args(["restore", "."]).status();
+                                    disable_raw_mode()?;
+                                    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                                    let passed = run_test_command(&app.test_command);
+                                    if passed {
+                                        app.save();
+                                        let msg = if let FocusedRow::Task(di) = &app.focused {
+                                            if let Some(&real) = vis.get(*di) {
+                                                format!("TCR: completed task \"{}\"", app.tasks[real].description)
+                                            } else { "TCR: tests passed".to_string() }
+                                        } else { "TCR: tests passed".to_string() };
+                                        match commit_tasks(&msg) {
+                                            Ok(_) => println!("Committed: {}", msg),
+                                            Err(e) => println!("Not committed: {}", e),
+                                        }
+                                    } else {
+                                        println!("Tests failed, reverting...");
+                                        let _ = Command::new("git").args(["restore", "."]).status();
+                                    }
+                                    println!("Press Enter to return...");
+                                    let _ = io::stdin().read_line(&mut String::new());
+                                    enable_raw_mode()?;
+                                    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+                                    let backend = CrosstermBackend::new(stdout());
+                                    *terminal = Terminal::new(backend)?;
+                                    app.invalidate_git_caches();
                                 }
-                                println!("Press Enter to return...");
-                                let _ = io::stdin().read_line(&mut String::new());
-                                enable_raw_mode()?;
-                                execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-                                let backend = CrosstermBackend::new(stdout());
-                                *terminal = Terminal::new(backend)?;
                             }
                             (_, KeyCode::Char('c')) => {
                                 app.commit_msg_buf.clear();
@@ -1012,8 +1115,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                                 }
                             }
                             (_, KeyCode::Char('E')) => {
-                                export_to_json(&app.tasks);
-                                app.status_msg = "Exported to tasks.json".to_string();
+                                let path = if app.current_project.is_empty() {
+                                    "tasks.json".to_string()
+                                } else {
+                                    format!("{}/{}.json", PROJECTS_DIR, app.current_project)
+                                };
+                                match export_to_json(&app.tasks, &path) {
+                                    Ok(_) => app.status_msg = format!("Exported to {}", path),
+                                    Err(e) => app.status_msg = format!("Export failed: {}", e),
+                                }
                             }
                             (_, KeyCode::Char('S')) => {
                                 app.sort_mode = app.sort_mode.next();
@@ -1053,6 +1163,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                         KeyCode::Enter | KeyCode::Esc => {
                             app.search_query = app.input.drain(..).collect();
                             app.selected = 0;
+                            app.focused = FocusedRow::Task(0);
                             app.mode = Mode::View;
                         }
                         KeyCode::Char(c) => {
@@ -1060,26 +1171,30 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                             // Live filter — update query immediately
                             app.search_query = app.input.clone();
                             app.selected = 0;
+                            app.focused = FocusedRow::Task(0);
                         }
                         KeyCode::Backspace => {
                             app.input.pop();
                             app.search_query = app.input.clone();
                             app.selected = 0;
+                            app.focused = FocusedRow::Task(0);
                         }
                         _ => {}
                     },
 
                     Mode::Input => match key.code {
                         KeyCode::Enter => {
-                            app.push_undo();
-                            let text: String = app.input.drain(..).collect();
-                            if let Some(task) = Task::new(text) {
-                                app.tasks.push(task);
-                                app.save();
-                                app.mode = Mode::View;
-                            } else {
+                            if app.input.trim().is_empty() {
                                 app.status_msg = "Task description cannot be empty.".to_string();
-                                app.mode = Mode::View;
+                                // Stay in Input mode so the user can keep typing
+                            } else {
+                                let text: String = app.input.drain(..).collect();
+                                if let Some(task) = Task::new(text) {
+                                    app.push_undo();
+                                    app.tasks.push(task);
+                                    app.save();
+                                    app.mode = Mode::View;
+                                }
                             }
                         }
                         KeyCode::Esc => { app.input.clear(); app.mode = Mode::View; }
@@ -1093,21 +1208,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                         match key.code {
                             KeyCode::Enter => {
                                 if let Some(&real) = vis.get(app.selected) {
-                                    let text: String = app.input.drain(..).collect();
-                                    if let Some(updated) = Task::new(text) {
-                                        app.push_undo();
-                                        let old = &app.tasks[real];
-                                        app.tasks[real] = Task {
-                                            status: old.status.clone(),
-                                            created_at: old.created_at.clone(),
-                                            subtasks: old.subtasks.clone(),
-                                            ..updated
-                                        };
-                                        app.save();
-                                        app.mode = Mode::View;
-                                    } else {
+                                    if app.input.trim().is_empty() {
                                         app.status_msg = "Description cannot be empty.".to_string();
-                                        app.mode = Mode::View;
+                                        // Stay in Edit mode so the text isn't lost
+                                    } else {
+                                        let text: String = app.input.drain(..).collect();
+                                        if let Some(updated) = Task::new(text) {
+                                            app.push_undo();
+                                            let old = &app.tasks[real];
+                                            app.tasks[real] = Task {
+                                                status: old.status.clone(),
+                                                created_at: old.created_at.clone(),
+                                                subtasks: old.subtasks.clone(),
+                                                ..updated
+                                            };
+                                            app.save();
+                                            app.mode = Mode::View;
+                                        }
                                     }
                                 }
                             }
@@ -1127,16 +1244,19 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                                     FocusedRow::Task(di) => *di,
                                     FocusedRow::Subtask(di, _) => *di,
                                 };
-                                if let Some(&real) = vis.get(parent_di) {
+                                if app.input.trim().is_empty() {
+                                    app.status_msg = "Subtask description cannot be empty.".to_string();
+                                    // Stay in Subtask mode so the user can keep typing
+                                } else if let Some(&real) = vis.get(parent_di) {
                                     let text: String = app.input.drain(..).collect();
                                     if let Some(sub) = Subtask::new(text) {
                                         app.push_undo();
                                         app.tasks[real].subtasks.push(sub);
                                         app.save();
                                         app.status_msg = "Subtask added.".to_string();
+                                        app.mode = Mode::View;
                                     }
                                 }
-                                app.mode = Mode::View;
                             }
                             KeyCode::Esc => { app.input.clear(); app.mode = Mode::View; }
                             KeyCode::Char(c) => app.input.push(c),
@@ -1151,18 +1271,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                             KeyCode::Enter => {
                                 if let FocusedRow::Subtask(di, si) = app.focused.clone() {
                                     if let Some(&real) = vis.get(di) {
-                                        let text: String = app.input.drain(..).collect();
-                                        let trimmed = text.trim().to_string();
-                                        if !trimmed.is_empty() {
-                                            app.push_undo();
-                                            app.tasks[real].subtasks[si].description = trimmed;
-                                            app.save();
-                                        } else {
+                                        if app.input.trim().is_empty() {
                                             app.status_msg = "Subtask description cannot be empty.".to_string();
+                                            // Stay in EditSubtask mode so the text isn't lost
+                                        } else {
+                                            let text: String = app.input.drain(..).collect();
+                                            app.push_undo();
+                                            app.tasks[real].subtasks[si].description = text.trim().to_string();
+                                            app.save();
+                                            app.mode = Mode::View;
                                         }
                                     }
                                 }
-                                app.mode = Mode::View;
                             }
                             KeyCode::Esc => { app.input.clear(); app.mode = Mode::View; }
                             KeyCode::Char(c) => app.input.push(c),
@@ -1189,7 +1309,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                             if !msg.is_empty() {
                                 app.save();
                                 match commit_tasks(&msg) {
-                                    Ok(_) => app.status_msg = "Committed!".to_string(),
+                                    Ok(_) => {
+                                        app.invalidate_git_caches();
+                                        app.status_msg = "Committed!".to_string();
+                                    }
                                     Err(e) => app.status_msg = format!("Commit failed: {}", e),
                                 }
                             }
@@ -1206,13 +1329,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
                         KeyCode::Enter => {
                             let name: String = app.input.drain(..).collect();
                             let name = name.trim().to_string();
-                            app.load_project(&name);
-                            app.mode = Mode::View;
-                            app.status_msg = if name.is_empty() {
-                                "Switched to default project.".to_string()
+                            if !name.is_empty() && !is_valid_project_name(&name) {
+                                app.status_msg = format!("Invalid project name: \"{}\" (no '/' or '\\')", name);
+                                app.mode = Mode::View;
                             } else {
-                                format!("Switched to project: {}", name)
-                            };
+                                app.load_project(&name);
+                                app.mode = Mode::View;
+                                app.status_msg = if name.is_empty() {
+                                    "Switched to default project.".to_string()
+                                } else {
+                                    format!("Switched to project: {}", name)
+                                };
+                            }
                         }
                         KeyCode::Char(c) => app.input.push(c),
                         KeyCode::Backspace => { app.input.pop(); }
@@ -1224,4 +1352,103 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result
     }
 
     Ok(())
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(19_753), (2024, 1, 31));
+        assert_eq!(civil_from_days(19_754), (2024, 2, 1));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29)); // leap day
+        assert_eq!(civil_from_days(20_680), (2026, 8, 15));
+    }
+
+    #[test]
+    fn current_date_is_iso_format() {
+        let d = current_date();
+        assert!(is_valid_date(&d), "got: {d}");
+    }
+
+    #[test]
+    fn date_validation() {
+        assert!(is_valid_date("2025-06-01"));
+        assert!(is_valid_date("1999-12-31"));
+        assert!(!is_valid_date("2025-13-01"));   // bad month
+        assert!(!is_valid_date("2025-00-10"));   // bad month
+        assert!(!is_valid_date("2025-06-32"));   // bad day
+        assert!(!is_valid_date("2025-06-00"));   // bad day
+        assert!(!is_valid_date("2025-6-01"));    // wrong width
+        assert!(!is_valid_date("abcd-ef-gh"));
+        assert!(!is_valid_date("2025/06/01"));
+        assert!(!is_valid_date(""));
+    }
+
+    #[test]
+    fn invalid_due_token_stays_in_description() {
+        let (rest, due) = parse_due_date("fix bug due:2025-99-99");
+        assert_eq!(rest, "fix bug due:2025-99-99");
+        assert_eq!(due, None);
+        let (rest, due) = parse_due_date("fix bug due:2025-06-01");
+        assert_eq!(rest, "fix bug");
+        assert_eq!(due, Some("2025-06-01".to_string()));
+    }
+
+    #[test]
+    fn task_metadata_parsing() {
+        let t = Task::new("Fix login bug #bug #auth due:2025-06-01 p:high".to_string()).unwrap();
+        assert_eq!(t.description, "Fix login bug");
+        assert_eq!(t.tags, vec!["bug", "auth"]);
+        assert_eq!(t.due_date, Some("2025-06-01".to_string()));
+        assert_eq!(t.priority, Priority::High);
+        assert!(is_overdue("2025-06-01", "2026-01-01"));
+        assert!(!is_overdue("2025-06-01", "2025-06-01"));
+    }
+
+    #[test]
+    fn project_name_validation() {
+        assert!(is_valid_project_name("work"));
+        assert!(is_valid_project_name("side-project"));
+        assert!(!is_valid_project_name(""));
+        assert!(!is_valid_project_name("."));
+        assert!(!is_valid_project_name(".."));
+        assert!(!is_valid_project_name("a/b"));
+        assert!(!is_valid_project_name("../escape"));
+        assert!(!is_valid_project_name("a\\b"));
+    }
+
+    #[test]
+    fn roundtrip_save_and_load() {
+        let mut tasks = vec![];
+        let mut t = Task::new("write tests #meta p:high".to_string()).unwrap();
+        t.status = Status::Working;
+        t.created_at = "2026-01-01".to_string();
+        t.subtasks.push(Subtask::new("unit tests".to_string()).unwrap());
+        t.subtasks[0].status = SubStatus::Done;
+        t.subtasks.push(Subtask::new("integration tests".to_string()).unwrap());
+        tasks.push(t);
+
+        let dir = std::env::temp_dir().join("grit-test-roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        save_tasks_to(&tasks, path.to_str().unwrap()).unwrap();
+
+        let loaded = load_tasks_from(path.to_str().unwrap());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].description, "write tests");
+        assert_eq!(loaded[0].status, Status::Working);
+        assert_eq!(loaded[0].priority, Priority::High);
+        assert_eq!(loaded[0].tags, vec!["meta"]);
+        assert_eq!(loaded[0].created_at, "2026-01-01");
+        assert_eq!(loaded[0].subtasks.len(), 2);
+        assert_eq!(loaded[0].subtasks[0].status, SubStatus::Done);
+        assert_eq!(loaded[0].subtasks[1].status, SubStatus::Pending);
+        fs::remove_file(&path).unwrap();
+    }
 }

@@ -1,6 +1,6 @@
 # Rust TUI Task Manager
 
-A terminal user interface (TUI) task manager built with Rust and tui-rs, designed to manage tasks and subtasks efficiently from your terminal — with Git TCR integration, project switching, search, undo, and more.
+A terminal user interface (TUI) task manager built with Rust and ratatui, designed to manage tasks and subtasks efficiently from your terminal — with Git TCR integration, project switching, search, undo, and more.
 
 ---
 
@@ -39,17 +39,18 @@ A terminal user interface (TUI) task manager built with Rust and tui-rs, designe
 - The `projects/` directory is only created when you first switch to a named project.
 
 ### Git and TCR integration
-- **`t`** — runs your configured test command. If tests pass, saves and commits automatically. If tests fail, reverts all changes with `git restore .`.
-- **`T`** — set or change the test command (e.g. `cargo test`, `npm test`).
+- **`t`** — runs your configured test command. If tests pass, saves and commits automatically. If tests fail, reverts all changes with `git restore .`. Running tests with no command configured does nothing (it never reverts).
+- **`T`** — set or change the test command (e.g. `cargo test`, `npm test`). The command is run through your shell, so `&&`, pipes and quotes work.
 - **`c`** — write a custom commit message and commit immediately.
 - Commits are **blocked on `main` and `master`** — if you are on either of those branches the commit is refused with a clear message, so you are never accidentally committing TCR changes to your main branch.
+- Task files (`tasks.md`, `tasks.json`, `projects/`) are kept out of commits — only code changes are committed.
 - The current git branch is displayed in the header bar at all times.
 - Press `g` to toggle a panel showing the last four commits.
 
 ### Persistence and export
 - Tasks are saved to `tasks.md` (or `projects/<name>.md`) in human-readable Markdown, grouped by status (Working, Pending, Done).
 - The file is only created when you actually add a task — launching the app in an empty directory creates no files.
-- Press `E` to export the current task list to `tasks.json`.
+- Press `E` to export the current task list to `tasks.json` (or `projects/<name>.json` when a project is active).
 
 ### UI
 - Header bar showing project name, git branch, sort mode, and task counts (pending / working / done).
