@@ -14,16 +14,18 @@ A terminal user interface (TUI) task manager built with Rust and ratatui, design
 
 ### Subtasks
 - Add one or more subtasks to any task (`s`).
-- Subtasks are displayed inline below their parent with tree connectors (`├─` / `└─`).
+- **Nesting:** focus a subtask and press `s` again to add a *child* under it — subtasks can nest to any depth.
+- Subtasks are displayed inline below their parent with tree connectors (`├─` / `└─`), indented per level.
 - Navigate into subtasks with `j`/`k` — the cursor moves through tasks and subtasks as a flat list.
 - Toggle a subtask between `[ ]` and `[x]` with `Enter`, just like a top-level task.
-- Edit (`e`) or delete (`d`) a subtask directly while it is focused.
-- A `[done/total]` badge on the task header shows subtask completion at a glance.
-- Subtask state is saved to disk and restored exactly on next launch.
+- Edit (`e`) or delete (`d`) a subtask at any depth directly while it is focused.
+- A `[done/total]` badge on tasks and parents shows subtask completion across the whole subtree at a glance.
+- Subtask state (including nesting) is saved to disk and restored exactly on next launch. Older files with flat subtasks are read as-is.
 
 ### Undo
 - Press `u` to undo the last change (delete, edit, status toggle, priority change, subtask add/delete).
-- Up to 50 undo levels are kept in memory per session.
+- Press `Ctrl+r` to redo an undone change.
+- Up to 50 undo/redo levels are kept in memory per session; any new change discards the redo history.
 
 ### Search and filter
 - Press `/` to open a live search bar — the list filters as you type by description or tag.
@@ -40,7 +42,7 @@ A terminal user interface (TUI) task manager built with Rust and ratatui, design
 
 ### Git and TCR integration
 - **`t`** — runs your configured test command. If tests pass, saves and commits automatically. If tests fail, reverts all changes with `git restore .`. Running tests with no command configured does nothing (it never reverts).
-- **`T`** — set or change the test command (e.g. `cargo test`, `npm test`). The command is run through your shell, so `&&`, pipes and quotes work.
+- **`T`** — set or change the test command (e.g. `cargo test`, `npm test`). The command is run through your shell, so `&&`, pipes and quotes work. It is saved to `.grit.json` and **persists between sessions**.
 - **`c`** — write a custom commit message and commit immediately.
 - Commits are **blocked on `main` and `master`** — if you are on either of those branches the commit is refused with a clear message, so you are never accidentally committing TCR changes to your main branch.
 - Task files (`tasks.md`, `tasks.json`, `projects/`) are kept out of commits — only code changes are committed.
@@ -51,6 +53,7 @@ A terminal user interface (TUI) task manager built with Rust and ratatui, design
 - Tasks are saved to `tasks.md` (or `projects/<name>.md`) in human-readable Markdown, grouped by status (Working, Pending, Done).
 - The file is only created when you actually add a task — launching the app in an empty directory creates no files.
 - Press `E` to export the current task list to `tasks.json` (or `projects/<name>.json` when a project is active).
+- Press `I` to import tasks from `tasks.json` (or `projects/<name>.json` when a project is active) — type a custom path to import a different file. You'll be asked how to merge: **`a`** appends to the current list, skipping duplicates (same description + created date), **`r`** replaces the current list. The whole import is a single undo step, so `u` reverses it.
 
 ### UI
 - Header bar showing project name, git branch, sort mode, and task counts (pending / working / done).
@@ -83,6 +86,8 @@ Fix login bug #bug #auth due:2025-06-01 p:high
 |---|---|
 | `j` / `↓` | Move down (through tasks and subtasks) |
 | `k` / `↑` | Move up |
+| `G` | Jump to bottom (deepest row) |
+| `H` | Jump to top |
 | `?` | Toggle help overlay |
 | `q` | Quit |
 
@@ -94,8 +99,9 @@ Fix login bug #bug #auth due:2025-06-01 p:high
 | `d` | Delete focused task or subtask |
 | `Enter` | Toggle status (task) or toggle done (subtask) |
 | `p` | Cycle priority (High → Medium → Low → High) |
-| `s` | Add subtask to focused task |
+| `s` | Add subtask to focused task — or a child under a focused subtask |
 | `u` | Undo last action |
+| `Ctrl+r` | Redo |
 
 ### View and filter
 | Key | Action |
@@ -117,6 +123,7 @@ Fix login bug #bug #auth due:2025-06-01 p:high
 | Key | Action |
 |---|---|
 | `E` | Export tasks to `tasks.json` |
+| `I` | Import tasks from `tasks.json` (`a` = append with dedupe, `r` = replace) |
 
 ---
 

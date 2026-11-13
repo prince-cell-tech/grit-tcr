@@ -1,6 +1,6 @@
 [package]
 name = "grit"
-version = "0.4.1"
+version = "0.7.0"
 edition = "2021"
 authors = ["Prince Riwa"]
 description = "A TUI task manager with Git and TCR integration"
