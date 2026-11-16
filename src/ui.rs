@@ -12,12 +12,11 @@ use crossterm::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::error::Error;
 use std::io::{self, stdout};
-use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Recursively render a subtask tree as list rows with tree connectors.
 // `ancestor_continues` is one bool per ancestor level: true when that ancestor
@@ -84,8 +83,11 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
 
             // Layout: header | task list | [git log] | input | status bar
             let git_log_height = if app.show_git_log { 6u16 } else { 0 };
+            let tcr_height: u16 = if app.show_tcr_output {
+                (app.tcr_output_tail.len() as u16).min(15) + 2
+            } else { 0 };
             let input_height: u16 = match app.mode {
-                Mode::Input | Mode::Edit | Mode::EditSubtask | Mode::Test | Mode::Search | Mode::Subtask | Mode::CommitMsg | Mode::Import | Mode::ImportMerge => 3,
+                Mode::Input | Mode::Edit | Mode::EditSubtask | Mode::Test | Mode::Search | Mode::Subtask | Mode::CommitMsg | Mode::Import | Mode::ImportMerge | Mode::ReloadPrompt | Mode::Filter | Mode::CommitTemplate => 3,
                 _ => 0,
             };
 
@@ -93,7 +95,7 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
             // The list area accounts for the margin, header, status bar and any open panels.
             let vis = app.visible_indices();
             let flat_row = app.focused_to_row_index(&vis);
-            let list_height = size.height.saturating_sub(5 + git_log_height + input_height) as usize;
+            let list_height = size.height.saturating_sub(5 + git_log_height + tcr_height + input_height) as usize;
             if flat_row >= app.scroll_offset + list_height {
                 app.scroll_offset = flat_row + 1 - list_height;
             }
@@ -108,6 +110,7 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                     Constraint::Length(2),           // header
                     Constraint::Min(3),              // task list
                     Constraint::Length(git_log_height),
+                    Constraint::Length(tcr_height),
                     Constraint::Length(input_height),
                     Constraint::Length(1),           // status bar
                 ])
@@ -118,58 +121,42 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
             let branch = app.cached_branch();
             let proj_label = if app.current_project.is_empty() { "default".to_string() } else { app.current_project.clone() };
             let sort_label = app.sort_mode.label();
+            let auto_label = if app.auto_tcr { " | auto-TCR" } else { "" };
             let header_text = format!(
-                " 📋 {} | branch: {} | sort: {} | pending:{} working:{} done:{}",
-                proj_label, branch, sort_label, pending, working, done
+                " 📋 {} | branch: {} | sort: {} | pending:{} working:{} done:{}{}",
+                proj_label, branch, sort_label, pending, working, done, auto_label
             );
             let header = Paragraph::new(header_text)
                 .style(Style::default().fg(Color::Cyan));
             f.render_widget(header, chunks[0]);
 
-            // ── Help overlay ──
-            if app.mode == Mode::Help {
-                let help_lines = vec![
-                    Line::from(Span::styled(" Navigation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" j/↓  move down          k/↑  move up"),
-                    Line::from(" G    jump to bottom      H    jump to top"),
-                    Line::from(" Enter toggle status      d    delete task"),
-                    Line::from(""),
-                    Line::from(Span::styled(" Task management", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" a    add task            e    edit task / subtask"),
-                    Line::from(" s    add subtask         u    undo"),
-                    Line::from(" p    cycle priority      d    delete task / subtask"),
-                    Line::from(" Ctrl+r redo"),
-                    Line::from(""),
-                    Line::from(Span::styled(" Subtasks", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" j/k  navigate into subtasks (they appear below their task)"),
-                    Line::from(" Enter toggle subtask [ ] / [x]   e  edit subtask text"),
-                    Line::from(" s    on a subtask: add a child under it (nesting)"),
-                    Line::from(""),
-                    Line::from(Span::styled(" View / filter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" /    search              Esc  clear search"),
-                    Line::from(" S    cycle sort           g    toggle git log"),
-                    Line::from(" P    switch project"),
-                    Line::from(""),
-                    Line::from(Span::styled(" TCR / git", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" T    set test command    t    run test+commit"),
-                    Line::from(" c    custom commit msg"),
-                    Line::from(""),
-                    Line::from(Span::styled(" Import / export / quit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-                    Line::from(" I    import from JSON    E    export to JSON"),
-                    Line::from(" q    quit                ?    toggle this help"),
-                    Line::from(""),
-                    Line::from(Span::styled(" Task syntax when adding/editing:", Style::default().fg(Color::Cyan))),
-                    Line::from("  #tag  due:YYYY-MM-DD  p:high / p:medium / p:low"),
-                    Line::from("  Example: Fix login bug #bug due:2025-06-01 p:high"),
-                ];
-                let help = Paragraph::new(help_lines)
-                    .block(Block::default().title("Help (? to close)").borders(Borders::ALL))
+            // ── Patch browser overlay ──
+            if app.mode == Mode::PatchBrowser {
+                // ── Patch browser overlay ──
+                let mut lines: Vec<Line> = vec![];
+                for (i, name) in app.patches.iter().enumerate() {
+                    let style = if i == app.patch_selected {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    lines.push(Line::from(Span::styled(format!(" {}", name), style)));
+                }
+                let browser = Paragraph::new(lines)
+                    .block(Block::default().title("Revert patches — Enter: apply, d: delete, Esc: close").borders(Borders::ALL))
                     .style(Style::default());
-                f.render_widget(help, chunks[1]);
+                f.render_widget(Clear, chunks[1]);
+                f.render_widget(browser, chunks[1]);
             } else {
                 // ── Task list ──
                 let title = if !app.search_query.is_empty() {
-                    format!("Tasks [search: \"{}\"] — ? for help", app.search_query)
+                    if !app.filter_query.is_empty() {
+                        format!("Tasks [filter: \"{}\"] [search: \"{}\"] — ? for help", app.filter_query, app.search_query)
+                    } else {
+                        format!("Tasks [search: \"{}\"] — ? for help", app.search_query)
+                    }
+                } else if !app.filter_query.is_empty() {
+                    format!("Tasks [filter: \"{}\"] — ? for help", app.filter_query)
                 } else {
                     "Tasks — ? for help".to_string()
                 };
@@ -250,6 +237,15 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                 f.render_widget(log_widget, chunks[2]);
             }
 
+            // ── TCR failure output panel ──
+            if app.show_tcr_output && tcr_height > 0 {
+                let lines: Vec<Line> = app.tcr_output_tail.iter().map(|l| Line::from(l.as_str())).collect();
+                let panel = Paragraph::new(lines)
+                    .block(Block::default().title("TCR failed — last output (Esc to close)").borders(Borders::ALL))
+                    .style(Style::default().fg(Color::Red));
+                f.render_widget(panel, chunks[3]);
+            }
+
             // ── Input box ──
             if input_height > 0 {
                 let (title, hint) = match app.mode {
@@ -260,6 +256,9 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                     Mode::Search => ("Search", " filter tasks by description or tag (Esc to clear)"),
                     Mode::Subtask => ("Add subtask / child", " Enter to confirm, Esc to cancel"),
                     Mode::CommitMsg => ("Commit message", " Enter to commit, Esc to cancel"),
+                    Mode::CommitTemplate => ("Commit message template", " placeholders: {task} {status} {date}"),
+                    Mode::ReloadPrompt => ("⚠ Task file changed on disk", " d = reload from disk, k = keep my version"),
+                    Mode::Filter => ("Filter", " #tag  s:pending|working|done  p:high|medium|low  + plain words (Esc exits)"),
                     Mode::Import => ("Import tasks", " path to tasks.json (blank = this project's JSON), Enter to continue"),
                     Mode::ImportMerge => ("Import tasks", " how to merge? a = append (dedupe), r = replace, Esc to cancel"),
                     _ => ("", ""),
@@ -267,8 +266,8 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                 let display = format!("{}{}", app.input, hint);
                 let input_widget = Paragraph::new(display.as_str())
                     .block(Block::default().title(title).borders(Borders::ALL))
-                    .style(Style::default().fg(Color::Green));
-                f.render_widget(input_widget, chunks[3]);
+                    .style(Style::default().fg(if app.mode == Mode::ReloadPrompt { Color::Red } else { Color::Green }));
+                f.render_widget(input_widget, chunks[4]);
             }
 
             // ── Status bar ──
@@ -280,8 +279,62 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
             };
             let status_bar = Paragraph::new(status_text.as_str())
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(status_bar, chunks[4]);
+            f.render_widget(status_bar, chunks[5]);
+
+            // ── Help overlay (full-screen modal, rendered last) ──
+            if app.mode == Mode::Help {
+                let help_lines = vec![
+                    Line::from(Span::styled(" Navigation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" j/↓  move down          k/↑  move up"),
+                    Line::from(" G    jump to bottom      H    jump to top"),
+                    Line::from(" Enter toggle status      d    delete task"),
+                    Line::from(Span::styled(" Task management", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" a    add task            e    edit task / subtask"),
+                    Line::from(" s    add subtask         u    undo   Ctrl+r redo"),
+                    Line::from(" p    cycle priority      d    delete task / subtask"),
+                    Line::from(Span::styled(" Subtasks", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" j/k  navigate into subtasks (they appear below their task)"),
+                    Line::from(" Enter toggle subtask [ ] / [x]   e  edit subtask text"),
+                    Line::from(" s    on a subtask: add a child under it (nesting)"),
+                    Line::from(Span::styled(" View / filter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" /    search              Esc  clear search/filter"),
+                    Line::from(" f    filter (#tag, s:status, p:priority + words)"),
+                    Line::from(" S    cycle sort           g    toggle git log"),
+                    Line::from(" P    switch project"),
+                    Line::from(Span::styled(" TCR / git", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" T    set test command    t    run test+commit"),
+                    Line::from(" c    custom commit msg   m    commit msg template"),
+                    Line::from(" A    toggle auto-TCR (runs on file changes)"),
+                    Line::from(" r    restore a reverted change from a patch"),
+                    Line::from(Span::styled(" Import / export / quit", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(" I    import from JSON    E    export to JSON"),
+                    Line::from(" q    quit                ?    toggle this help"),
+                    Line::from(Span::styled(" Task syntax:  #tag  due:YYYY-MM-DD  p:high|medium|low", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("   e.g. Fix login bug #bug due:2025-06-01 p:high", Style::default().fg(Color::DarkGray))),
+                ];
+                let help = Paragraph::new(help_lines)
+                    .block(Block::default().title("Help (? to close)").borders(Borders::ALL))
+                    .style(Style::default());
+                // Clear first: Paragraph only paints its text lines, so
+                // without this, earlier widgets bleed through below the text.
+                f.render_widget(Clear, size);
+                f.render_widget(help, size);
+            }
         })?;
+
+        // Non-blocking: collect a finished background auto-TCR run.
+        app.poll_tcr_result();
+
+        // Throttled polling (every 2s): external task-file edits → prompt;
+        // working-tree changes → auto-TCR run (only while idle in View).
+        if app.mode == Mode::View && app.last_poll.elapsed() >= Duration::from_secs(2) {
+            app.last_poll = Instant::now();
+            if app.detect_external_edit() {
+                app.mode = Mode::ReloadPrompt;
+            } else if app.auto_tcr {
+                app.maybe_start_auto_tcr();
+            }
+        }
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -424,6 +477,26 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                                 app.input = app.test_command.clone();
                                 app.mode = Mode::Test;
                             }
+                            (_, KeyCode::Char('m')) => {
+                                app.input = app.commit_template.clone();
+                                app.mode = Mode::CommitTemplate;
+                            }
+                            (_, KeyCode::Char('A')) => {
+                                app.toggle_auto_tcr();
+                            }
+                            (_, KeyCode::Char('r')) => {
+                                app.patches = crate::git::list_patches();
+                                app.patch_selected = 0;
+                                if app.patches.is_empty() {
+                                    app.status_msg = "No saved patches.".to_string();
+                                } else {
+                                    app.mode = Mode::PatchBrowser;
+                                }
+                            }
+                            (_, KeyCode::Char('f')) => {
+                                app.input = app.filter_query.clone();
+                                app.mode = Mode::Filter;
+                            }
                             (_, KeyCode::Char('t')) => {
                                 if app.test_command.trim().is_empty() {
                                     // Never treat a missing command as a failing test —
@@ -435,18 +508,14 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                                     let passed = run_test_command(&app.test_command);
                                     if passed {
                                         app.save();
-                                        let msg = if let FocusedRow::Task(di) = &app.focused {
-                                            if let Some(&real) = vis.get(*di) {
-                                                format!("TCR: completed task \"{}\"", app.tasks[real].description)
-                                            } else { "TCR: tests passed".to_string() }
-                                        } else { "TCR: tests passed".to_string() };
+                                        let msg = app.build_commit_message(&vis);
                                         match commit_tasks(&msg) {
                                             Ok(_) => println!("Committed: {}", msg),
                                             Err(e) => println!("Not committed: {}", e),
                                         }
                                     } else {
                                         println!("Tests failed, reverting...");
-                                        let _ = Command::new("git").args(["restore", "."]).status();
+                                        crate::git::revert_worktree();
                                     }
                                     println!("Press Enter to return...");
                                     let _ = io::stdin().read_line(&mut String::new());
@@ -458,8 +527,10 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                                 }
                             }
                             (_, KeyCode::Char('c')) => {
+                                // Prefill with the template-generated message; editable before commit.
+                                let vis2 = app.visible_indices();
+                                app.input = app.build_commit_message(&vis2);
                                 app.commit_msg_buf.clear();
-                                app.input.clear();
                                 app.mode = Mode::CommitMsg;
                             }
                             (_, KeyCode::Enter) => {
@@ -524,7 +595,13 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                                 app.mode = Mode::Search;
                             }
                             (KeyModifiers::NONE, KeyCode::Esc) => {
-                                if !app.search_query.is_empty() {
+                                if app.show_tcr_output {
+                                    app.show_tcr_output = false;
+                                } else if !app.filter_query.is_empty() {
+                                    app.filter_query.clear();
+                                    app.selected = 0;
+                                    app.focused = FocusedRow::Task(0);
+                                } else if !app.search_query.is_empty() {
                                     app.search_query.clear();
                                     app.selected = 0;
                                     app.focused = FocusedRow::Task(0);
@@ -558,6 +635,84 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
                             app.search_query = app.input.clone();
                             app.selected = 0;
                             app.focused = FocusedRow::Task(0);
+                        }
+                        _ => {}
+                    },
+
+                    Mode::ReloadPrompt => match key.code {
+                        // d → take the disk version; k / Esc / Enter → overwrite with ours
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            app.reload_from_disk();
+                            app.mode = Mode::View;
+                            app.status_msg = "Reloaded from disk. Press u to restore your version.".to_string();
+                        }
+                        KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Esc | KeyCode::Enter => {
+                            app.keep_my_version();
+                            app.mode = Mode::View;
+                            app.status_msg = "Kept your version.".to_string();
+                        }
+                        _ => {}
+                    },
+
+                    Mode::Filter => match key.code {
+                        KeyCode::Enter | KeyCode::Esc => { app.mode = Mode::View; }
+                        KeyCode::Char(c) => {
+                            app.input.push(c);
+                            // Live filter — update query immediately
+                            app.filter_query = app.input.clone();
+                            app.selected = 0;
+                            app.focused = FocusedRow::Task(0);
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                            app.filter_query = app.input.clone();
+                            app.selected = 0;
+                            app.focused = FocusedRow::Task(0);
+                        }
+                        _ => {}
+                    },
+
+                    Mode::CommitTemplate => match key.code {
+                        KeyCode::Enter => {
+                            let tpl: String = app.input.drain(..).collect();
+                            app.set_commit_template(tpl.trim().to_string()); // persists to .grit.json
+                            app.mode = Mode::View;
+                            app.status_msg = "Commit template saved.".to_string();
+                        }
+                        KeyCode::Esc => { app.input.clear(); app.mode = Mode::View; }
+                        KeyCode::Char(c) => app.input.push(c),
+                        KeyCode::Backspace => { app.input.pop(); }
+                        _ => {}
+                    },
+
+                    Mode::PatchBrowser => match key.code {
+                        KeyCode::Esc => app.mode = Mode::View,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if app.patch_selected + 1 < app.patches.len() { app.patch_selected += 1; }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.patch_selected = app.patch_selected.saturating_sub(1);
+                        }
+                        KeyCode::Enter => {
+                            if let Some(name) = app.patches.get(app.patch_selected).cloned() {
+                                match crate::git::apply_patch(&name) {
+                                    Ok(_) => {
+                                        app.status_msg = format!("Patch {} applied.", name);
+                                        app.invalidate_git_caches();
+                                    }
+                                    Err(e) => app.status_msg = e,
+                                }
+                                app.mode = Mode::View;
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if let Some(name) = app.patches.get(app.patch_selected).cloned() {
+                                let _ = crate::git::delete_patch(&name);
+                                app.patches.remove(app.patch_selected);
+                                app.patch_selected = app.patch_selected.min(app.patches.len().saturating_sub(1));
+                                app.status_msg = format!("Patch {} deleted.", name);
+                                if app.patches.is_empty() { app.mode = Mode::View; }
+                            }
                         }
                         _ => {}
                     },

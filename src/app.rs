@@ -45,6 +45,10 @@ pub enum Mode {
     Projects,
     Import,
     ImportMerge,
+    ReloadPrompt,    // task file changed on disk — reload or keep mine?
+    Filter,          // structured filter prompt (f)
+    CommitTemplate,  // edit commit-message template (m)
+    PatchBrowser,    // browse/apply/delete revert patches (r)
 }
 
 // Which row the cursor is on — a task header or one of its subtasks
@@ -59,13 +63,19 @@ pub struct App {
     pub selected: usize,        // display index (into visible_indices)
     pub focused: FocusedRow,    // which row is highlighted
     pub scroll_offset: usize,
+    // Exact on-disk content as of our last write/load; used to detect
+    // external edits of the task file (e.g. in an editor).
+    pub last_written: String,
     pub mode: Mode,
     pub input: String,
     pub test_command: String,
+    pub commit_template: String,   // placeholders: {task} {status} {date}
+    pub auto_tcr: bool,            // run tests+commit/revert automatically on file changes
     pub undo_stack: Vec<Snapshot>,
     pub redo_stack: Vec<Snapshot>,
     pub sort_mode: SortMode,
     pub search_query: String,
+    pub filter_query: String,      // structured filter: #tag, s:status, p:priority, words
     pub show_git_log: bool,
     pub current_project: String,   // filename without extension; empty = default
     pub projects: Vec<String>,
@@ -75,11 +85,22 @@ pub struct App {
     // Subprocess output is cached so rendering doesn't spawn git commands every frame.
     pub branch_cache: (String, Instant),
     pub git_log_cache: (Vec<String>, Instant),
+    // Auto-TCR: background test runs triggered by working-tree changes.
+    pub tcr_running: bool,
+    pub tcr_rx: Option<std::sync::mpsc::Receiver<(bool, String)>>,
+    pub last_tree_sig: Option<String>,   // last seen `git status --porcelain` output
+    pub last_poll: Instant,              // throttle for disk/tree polling
+    pub tcr_output_tail: Vec<String>,    // tail of failed test output (panel)
+    pub show_tcr_output: bool,
+    // Patch browser state (revert patches saved by a failed auto-TCR).
+    pub patches: Vec<String>,
+    pub patch_selected: usize,
 }
 
 impl App {
     pub fn new() -> Self {
         let tasks = load_tasks();
+        let cfg = load_config();
         App {
             tasks,
             selected: 0,
@@ -87,19 +108,31 @@ impl App {
             scroll_offset: 0,
             mode: Mode::View,
             input: String::new(),
-            test_command: load_config().test_command,
+            test_command: cfg.test_command,
+            commit_template: cfg.commit_template,
+            auto_tcr: cfg.auto_tcr,
             undo_stack: vec![],
             redo_stack: vec![],
             sort_mode: SortMode::None,
             search_query: String::new(),
+            filter_query: String::new(),
             show_git_log: false,
             current_project: String::new(),
             projects: list_projects(),
             commit_msg_buf: String::new(),
             status_msg: String::new(),
             import_path: String::new(),
+            last_written: crate::storage::file_content(TASKS_FILE),
             branch_cache: (git_branch(), Instant::now()),
             git_log_cache: (git_log(4), Instant::now()),
+            tcr_running: false,
+            tcr_rx: None,
+            last_tree_sig: None,
+            last_poll: Instant::now(),
+            tcr_output_tail: vec![],
+            show_tcr_output: false,
+            patches: vec![],
+            patch_selected: 0,
         }
     }
 
@@ -156,15 +189,42 @@ impl App {
         }
     }
 
-    pub fn save(&mut self) {
-        let path = if self.current_project.is_empty() {
+    // Path of the active task file (default tasks.md or projects/<name>.md).
+    pub fn tasks_path(&self) -> String {
+        if self.current_project.is_empty() {
             TASKS_FILE.to_string()
         } else {
             format!("{}/{}.md", PROJECTS_DIR, self.current_project)
-        };
+        }
+    }
+
+    pub fn save(&mut self) {
+        let path = self.tasks_path();
         if let Err(e) = save_tasks_to(&self.tasks, &path) {
             self.status_msg = format!("Save failed: {e}");
         }
+        self.last_written = crate::storage::file_content(&path);
+    }
+
+    // True when the task file on disk no longer matches what we last wrote.
+    pub fn detect_external_edit(&self) -> bool {
+        crate::storage::file_content(&self.tasks_path()) != self.last_written
+    }
+
+    // Discard the in-memory list and take the on-disk version. An undo
+    // snapshot is pushed first so `u` restores the in-memory version.
+    pub fn reload_from_disk(&mut self) {
+        self.push_undo();
+        self.tasks = load_tasks_from(&self.tasks_path());
+        self.selected = 0;
+        self.focused = FocusedRow::Task(0);
+        self.scroll_offset = 0;
+        self.last_written = crate::storage::file_content(&self.tasks_path());
+    }
+
+    // Overwrite the external edit with our in-memory version.
+    pub fn keep_my_version(&mut self) {
+        self.save();
     }
 
     pub fn load_project(&mut self, name: &str) {
@@ -184,6 +244,7 @@ impl App {
         self.selected = 0;
         self.focused = FocusedRow::Task(0);
         self.scroll_offset = 0;
+        self.last_written = crate::storage::file_content(&path);
     }
 
     // Path of the JSON file for the active project (used by export and import).
@@ -247,11 +308,19 @@ impl App {
     }
 
     pub fn visible_indices(&self) -> Vec<usize> {        let sorted = sorted_indices(&self.tasks, &self.sort_mode);
-        if self.search_query.is_empty() {
+        // Structured filter first (metadata + words), then free-text search,
+        // so both compose with AND semantics.
+        let filter = crate::task::TaskFilter::parse(&self.filter_query);
+        let filtered: Vec<usize> = if filter.is_empty() {
             sorted
         } else {
+            sorted.into_iter().filter(|&i| filter.matches(&self.tasks[i])).collect()
+        };
+        if self.search_query.is_empty() {
+            filtered
+        } else {
             let q = self.search_query.to_lowercase();
-            sorted.into_iter().filter(|&i| {
+            filtered.into_iter().filter(|&i| {
                 let t = &self.tasks[i];
                 t.description.to_lowercase().contains(&q)
                     || t.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
@@ -340,13 +409,49 @@ impl App {
         }
     }
 
-    // Set the test command and persist it to .grit.json so it survives restarts.
-    pub fn set_test_command(&mut self, cmd: String) {
-        self.test_command = cmd;
-        let cfg = GritConfig { test_command: self.test_command.clone() };
+    // Persist every config field at once so saving one never wipes another.
+    fn persist_config(&mut self) {
+        let cfg = GritConfig {
+            test_command: self.test_command.clone(),
+            commit_template: self.commit_template.clone(),
+            auto_tcr: self.auto_tcr,
+        };
         if let Err(e) = save_config(&cfg) {
             self.status_msg = format!("Config save failed: {e}");
         }
+    }
+
+    // Set the test command and persist it to .grit.json so it survives restarts.
+    pub fn set_test_command(&mut self, cmd: String) {
+        self.test_command = cmd;
+        self.persist_config();
+    }
+
+    // Set the commit-message template and persist it.
+    pub fn set_commit_template(&mut self, tpl: String) {
+        self.commit_template = tpl;
+        self.persist_config();
+    }
+
+    // Build the commit message from the template for the focused task.
+    // With no focused task there is nothing meaningful to generate, so a
+    // fixed fallback is used instead (custom one-off messages go through `c`).
+    pub fn build_commit_message(&self, vis: &[usize]) -> String {
+        let tpl = if self.commit_template.trim().is_empty() {
+            "TCR: {task}"
+        } else {
+            self.commit_template.as_str()
+        };
+        let ctx = match &self.focused {
+            FocusedRow::Task(di) => vis.get(*di).map(|&real| &self.tasks[real]),
+            FocusedRow::Subtask(di, _) => vis.get(*di).map(|&real| &self.tasks[real]),
+        };
+        let Some(task) = ctx else {
+            return "TCR: tests passed".to_string();
+        };
+        tpl.replace("{task}", &task.description)
+            .replace("{status}", task.status.label())
+            .replace("{date}", &crate::task::current_date())
     }
 
     // Jump to the first task row (H key)
@@ -393,6 +498,94 @@ impl App {
         self.branch_cache = (git_branch(), Instant::now());
         self.git_log_cache = (git_log(4), Instant::now());
     }
+
+    // ─── Auto-TCR ────────────────────────────────────────────────────────────
+
+    pub fn toggle_auto_tcr(&mut self) {
+        self.auto_tcr = !self.auto_tcr;
+        // Re-baseline so toggling on never fires immediately on old dirt.
+        self.last_tree_sig = None;
+        self.persist_config();
+        self.status_msg = if self.auto_tcr {
+            "Auto-TCR on: tests run+commit/revert when files change.".to_string()
+        } else {
+            "Auto-TCR off.".to_string()
+        };
+    }
+
+    // Called (throttled) from the event loop: watches the working tree and
+    // starts a TCR run when files change after saving in the editor.
+    pub fn maybe_start_auto_tcr(&mut self) {
+        if self.tcr_running { return; }
+        let Some(sig) = crate::git::working_tree_signature() else {
+            self.last_tree_sig = None; // not a repo (yet)
+            return;
+        };
+        if self.last_tree_sig.as_deref() == Some(sig.as_str()) { return; }
+        let is_baseline = self.last_tree_sig.is_none();
+        self.last_tree_sig = Some(sig.clone());
+        // Baseline poll and a clean tree never trigger a run.
+        if is_baseline || sig.trim().is_empty() { return; }
+        self.start_tcr_run();
+    }
+
+    fn start_tcr_run(&mut self) {
+        let cmd = self.test_command.clone();
+        if cmd.trim().is_empty() {
+            self.status_msg = "Auto-TCR skipped: no test command set (press T).".to_string();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tcr_rx = Some(rx);
+        self.tcr_running = true;
+        self.status_msg = "TCR running…".to_string();
+        std::thread::spawn(move || {
+            let result = crate::git::run_test_command_captured(&cmd);
+            let _ = tx.send(result);
+        });
+    }
+
+    // Non-blocking collection of a finished background TCR run.
+    pub fn poll_tcr_result(&mut self) {
+        let Some(rx) = &self.tcr_rx else { return };
+        let mut result = None;
+        while let Ok(r) = rx.try_recv() { result = Some(r); }
+        let Some((passed, output)) = result else { return };
+        self.tcr_running = false;
+        self.tcr_rx = None;
+        if passed {
+            self.save();
+            let vis = self.visible_indices();
+            let msg = self.build_commit_message(&vis);
+            match crate::git::commit_tasks(&msg) {
+                Ok(_) => {
+                    self.invalidate_git_caches();
+                    self.status_msg = format!("Auto-TCR: committed \"{msg}\"");
+                }
+                Err(e) => self.status_msg = format!("Auto-TCR: tests passed, not committed: {e}"),
+            }
+        } else {
+            // Capture the diff BEFORE reverting, so nothing is truly lost.
+            let diff = crate::git::git_diff_all();
+            let patch = if diff.trim().is_empty() {
+                None
+            } else {
+                crate::git::save_patch(&diff).ok()
+            };
+            crate::git::revert_worktree();
+            self.tcr_output_tail = output.lines()
+                .rev().take(15).collect::<Vec<_>>().into_iter().rev()
+                .map(|s| s.to_string()).collect();
+            self.show_tcr_output = true;
+            self.status_msg = match &patch {
+                Some(p) => format!("Auto-TCR: tests FAILED — reverted; patch saved: {}", p.display()),
+                None => "Auto-TCR: tests FAILED — nothing to revert".to_string(),
+            };
+        }
+        // The tree just changed (commit or revert) — re-baseline so the next
+        // poll doesn't mistake our own action for new editor changes.
+        self.last_tree_sig = crate::git::working_tree_signature();
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -400,7 +593,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::Subtask;
+    use crate::task::{Priority, Subtask};
     use std::sync::{Mutex, MutexGuard};
 
     // chdir is process-wide and tests run in parallel threads, so every test
@@ -690,6 +883,263 @@ mod tests {
         d.status = crate::task::Status::Done;
         app.tasks = vec![a, b, c, d];
         assert_eq!(app.task_counts(), (1, 1, 2));
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn commit_message_substitutes_template_placeholders() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        let mut t = Task::new("fix login bug".to_string()).unwrap();
+        t.status = Status::Working;
+        app.tasks.push(t);
+        app.commit_template = "fix: {task} [{status}] on {date}".to_string();
+        app.focused = FocusedRow::Task(0);
+
+        let vis = app.visible_indices();
+        let msg = app.build_commit_message(&vis);
+        assert_eq!(
+            msg,
+            format!("fix: fix login bug [working] on {}", crate::task::current_date())
+        );
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn commit_message_blank_template_defaults_to_tcr_task() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.tasks.push(Task::new("buy milk".to_string()).unwrap());
+        app.commit_template.clear(); // blank → default "TCR: {task}"
+        app.focused = FocusedRow::Task(0);
+
+        let vis = app.visible_indices();
+        assert_eq!(app.build_commit_message(&vis), "TCR: buy milk");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn commit_message_without_focused_task_uses_fallback() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.commit_template = "fix: {task}".to_string();
+        app.tasks.push(Task::new("buy milk".to_string()).unwrap());
+
+        // Cursor past the end of the list — no task to attach to
+        app.focused = FocusedRow::Task(99);
+        let vis = app.visible_indices();
+        assert_eq!(app.build_commit_message(&vis), "TCR: tests passed");
+
+        // Empty list entirely
+        app.tasks.clear();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+        assert_eq!(app.build_commit_message(&vis), "TCR: tests passed");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn commit_message_for_subtask_focus_uses_parent_task() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        let mut t = Task::new("parent task".to_string()).unwrap();
+        t.subtasks.push(Subtask::new("child step".to_string()).unwrap());
+        app.tasks.push(t);
+        app.commit_template = "TCR: {task}".to_string();
+        app.focused = FocusedRow::Subtask(0, vec![0]);
+
+        let vis = app.visible_indices();
+        assert_eq!(app.build_commit_message(&vis), "TCR: parent task");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn set_test_command_preserves_other_config_fields() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.set_commit_template("x: {task}".into());
+        app.set_test_command("cargo test".into());
+
+        let cfg = load_config();
+        assert_eq!(cfg.commit_template, "x: {task}", "template must survive a test-command save");
+        assert_eq!(cfg.test_command, "cargo test");
+        assert!(!cfg.auto_tcr);
+
+        // And the template itself round-trips into a fresh App
+        let app2 = App::new();
+        assert_eq!(app2.commit_template, "x: {task}");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn external_edit_detected_only_after_disk_content_changes() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        // Fresh dir, no file yet → nothing external happened
+        assert!(!app.detect_external_edit());
+
+        app.tasks.push(Task::new("my task".to_string()).unwrap());
+        app.save();
+        assert!(!app.detect_external_edit(), "file matches what we wrote");
+
+        // Someone edits tasks.md outside the app
+        std::fs::write("tasks.md", "- [ ] external edit\n").unwrap();
+        assert!(app.detect_external_edit());
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn reload_from_disk_pulls_external_tasks_and_keeps_undo_snapshot() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.tasks.push(Task::new("my task".to_string()).unwrap());
+        app.save();
+        std::fs::write("tasks.md", "- [ ] external task\n").unwrap();
+
+        app.reload_from_disk();
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].description, "external task");
+        assert!(!app.detect_external_edit(), "baseline updated after reload");
+        // The in-memory version is recoverable with `u`
+        app.undo();
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].description, "my task");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn keep_my_version_overwrites_external_edit() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.tasks.push(Task::new("my task".to_string()).unwrap());
+        app.save();
+        std::fs::write("tasks.md", "- [ ] external edit\n").unwrap();
+        assert!(app.detect_external_edit());
+
+        app.keep_my_version();
+        let on_disk = std::fs::read_to_string("tasks.md").unwrap();
+        assert!(on_disk.contains("my task"), "disk: {on_disk}");
+        assert!(!on_disk.contains("external edit"));
+        assert!(!app.detect_external_edit());
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn visible_indices_applies_filter_and_search_together() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        app.tasks.push(Task::new("fix login #auth".to_string()).unwrap());           // 0 pending
+        let mut docs = Task::new("write docs #meta".to_string()).unwrap();
+        docs.status = Status::Working;
+        app.tasks.push(docs);                                                       // 1 working
+        let mut milk = Task::new("buy milk".to_string()).unwrap();
+        milk.priority = Priority::High;
+        app.tasks.push(milk);                                                       // 2 pending high
+
+        // Status filter
+        app.filter_query = "s:pending".into();
+        assert_eq!(app.visible_indices(), vec![0, 2]);
+
+        // Tag filter
+        app.filter_query = "#meta".into();
+        assert_eq!(app.visible_indices(), vec![1]);
+
+        // Status AND priority combined
+        app.filter_query = "s:pending p:high".into();
+        assert_eq!(app.visible_indices(), vec![2]);
+
+        // Filter and search compose (AND)
+        app.filter_query = "s:pending".into();
+        app.search_query = "milk".into();
+        assert_eq!(app.visible_indices(), vec![2]);
+
+        // No filter → search alone, as before
+        app.filter_query.clear();
+        assert_eq!(app.visible_indices(), vec![2]);
+        restore_dir(&original);
+    }
+
+    fn run_git(args: &[&str]) {
+        let st = std::process::Command::new("git").args(args).status().expect("git must be available");
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn auto_tcr_flag_persists_and_survives_other_config_saves() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        assert!(!app.auto_tcr);
+        app.toggle_auto_tcr();
+        assert!(app.auto_tcr);
+
+        // A fresh App picks the flag up from disk…
+        let app2 = App::new();
+        assert!(app2.auto_tcr);
+        // …and saving a different field must not wipe it
+        let mut app3 = App::new();
+        app3.set_test_command("cargo test".into());
+        assert!(load_config().auto_tcr);
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn auto_tcr_runs_on_working_tree_change_and_commits_on_pass() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        // A real repo on a non-main branch (commit_tasks refuses main/master)
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("code.txt", "one\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        app.set_test_command("true".into()); // `sh -c true` always passes
+        app.toggle_auto_tcr();
+
+        // First poll only sets the baseline — a clean tree never triggers a run
+        app.maybe_start_auto_tcr();
+        assert!(!app.tcr_running, "clean tree must not trigger TCR");
+
+        // A file save (dirty tree) triggers the run
+        std::fs::write("code.txt", "one\ntwo\n").unwrap();
+        app.maybe_start_auto_tcr();
+        assert!(app.tcr_running);
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.poll_tcr_result();
+        assert!(!app.tcr_running);
+        let count = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2", "expected one TCR commit on top of init");
+
+        // Regression: after the commit the tree differs from the pre-run
+        // snapshot — a follow-up poll must NOT mistake that for new changes.
+        app.maybe_start_auto_tcr();
+        assert!(!app.tcr_running, "must not refire without new working-tree changes");
+        restore_dir(&original);
+    }
+
+    #[test]
+    fn auto_tcr_failure_reverts_tree_and_saves_patch() {
+        let (mut app, original, _lock) = app_in_temp_dir();
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("code.txt", "one\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        app.set_test_command("false".into()); // `sh -c false` always fails
+        app.toggle_auto_tcr();
+
+        app.maybe_start_auto_tcr(); // baseline
+        std::fs::write("code.txt", "one\ntwo\n").unwrap();
+        app.maybe_start_auto_tcr();
+        assert!(app.tcr_running);
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.poll_tcr_result();
+        assert!(!app.tcr_running);
+
+        // The tree was reverted to the committed state…
+        assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "one\n");
+        // …the failure output panel is shown…
+        assert!(app.show_tcr_output);
+        // …and the lost diff is recoverable as exactly one patch
+        let patches = crate::git::list_patches();
+        assert_eq!(patches.len(), 1, "patches: {patches:?}");
+        crate::git::delete_patch(&patches[0]).unwrap();
+        assert!(crate::git::list_patches().is_empty());
         restore_dir(&original);
     }
 

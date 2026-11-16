@@ -10,6 +10,17 @@ pub enum Status {
     Done,
 }
 
+impl Status {
+    // Lowercase label used in commit-message templates ({status}).
+    pub fn label(&self) -> &str {
+        match self {
+            Status::Pending => "pending",
+            Status::Working => "working",
+            Status::Done => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Priority {
     High,
@@ -200,6 +211,18 @@ pub fn current_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+// UTC date+time compacted for filenames: YYYYMMDDHHMMSS.
+pub fn current_datetime_compact() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{y:04}{m:02}{d:02}{h:02}{mi:02}{s:02}")
+}
+
 // Days since 1970-01-01 -> (year, month, day) in UTC.
 // Howard Hinnant's civil_from_days algorithm.
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -217,6 +240,63 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 pub fn is_overdue(due: &str, today: &str) -> bool {
     due < today
+}
+
+// ─── Filter ──────────────────────────────────────────────────────────────────
+
+// A structured filter parsed from the prompt opened with `f`.
+// Tokens: #tag, s:pending|working|done, p:high|medium|low, plain words.
+// Semantics: tags AND words must ALL match; multiple statuses/priorities
+// mean "any of them" (a task has exactly one of each).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TaskFilter {
+    tags: Vec<String>,
+    statuses: Vec<Status>,
+    priorities: Vec<Priority>,
+    words: Vec<String>,
+}
+
+impl TaskFilter {
+    pub fn parse(query: &str) -> Self {
+        let mut f = TaskFilter::default();
+        for word in query.split_whitespace() {
+            let lower = word.to_lowercase();
+            if let Some(tag) = lower.strip_prefix('#') {
+                if !tag.is_empty() {
+                    f.tags.push(tag.to_string());
+                }
+            } else if let Some(s) = lower.strip_prefix("s:") {
+                match s {
+                    "pending" | "p" => f.statuses.push(Status::Pending),
+                    "working" | "w" => f.statuses.push(Status::Working),
+                    "done" | "d" => f.statuses.push(Status::Done),
+                    _ => f.words.push(lower),
+                }
+            } else if let Some(p) = lower.strip_prefix("p:") {
+                match p {
+                    "high" | "h" => f.priorities.push(Priority::High),
+                    "medium" | "m" => f.priorities.push(Priority::Medium),
+                    "low" | "l" => f.priorities.push(Priority::Low),
+                    _ => f.words.push(lower),
+                }
+            } else {
+                f.words.push(lower);
+            }
+        }
+        f
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.statuses.is_empty() && self.priorities.is_empty() && self.words.is_empty()
+    }
+
+    pub fn matches(&self, task: &Task) -> bool {
+        let desc = task.description.to_lowercase();
+        self.tags.iter().all(|tag| task.tags.iter().any(|t| t.to_lowercase() == *tag))
+            && (self.statuses.is_empty() || self.statuses.contains(&task.status))
+            && (self.priorities.is_empty() || self.priorities.contains(&task.priority))
+            && self.words.iter().all(|w| desc.contains(w))
+    }
 }
 
 // ─── Sort ─────────────────────────────────────────────────────────────────────
@@ -427,6 +507,73 @@ mod tests {
         assert_eq!(parse_priority("x p:l").1, Priority::Low);
         assert_eq!(parse_priority("x p:high").0, "x");
         assert_eq!(parse_priority("x priority:high").0, "x priority:high");
+    }
+
+    #[test]
+    fn datetime_compact_is_14_digits() {
+        let d = current_datetime_compact();
+        assert_eq!(d.len(), 14, "got: {d}");
+        assert!(d.chars().all(|c| c.is_ascii_digit()), "got: {d}");
+    }
+
+    #[test]
+    fn status_labels() {
+        assert_eq!(Status::Pending.label(), "pending");
+        assert_eq!(Status::Working.label(), "working");
+        assert_eq!(Status::Done.label(), "done");
+    }
+
+    #[test]
+    fn filter_parse_extracts_tags_statuses_priorities_and_words() {
+        let f = TaskFilter::parse("#auth s:working p:high urgent");
+        assert_eq!(f.tags, vec!["auth"]);
+        assert_eq!(f.statuses, vec![Status::Working]);
+        assert_eq!(f.priorities, vec![Priority::High]);
+        assert_eq!(f.words, vec!["urgent"]);
+        assert!(!f.is_empty());
+
+        // Unknown s:/p: values fall back to plain word matching
+        let f = TaskFilter::parse("s:later");
+        assert!(f.statuses.is_empty());
+        assert_eq!(f.words, vec!["s:later"]);
+
+        // Everything at once is empty → matches everything
+        assert!(TaskFilter::parse("").is_empty());
+        assert!(TaskFilter::parse("   ").is_empty());
+        // A lone '#' contributes nothing
+        assert!(TaskFilter::parse("#").is_empty());
+    }
+
+    #[test]
+    fn filter_matches_requires_all_conditions() {
+        // tags AND words; statuses OR priorities are each single-valued so
+        // multiple selections mean "any of them"
+        let mut t = Task::new("fix login bug #auth #web".to_string()).unwrap();
+        t.status = Status::Working;
+        t.priority = Priority::High;
+
+        assert!(TaskFilter::parse("#auth").matches(&t));
+        assert!(TaskFilter::parse("#auth #web").matches(&t));
+        assert!(!TaskFilter::parse("#auth #missing").matches(&t));
+
+        assert!(TaskFilter::parse("login").matches(&t));
+        assert!(!TaskFilter::parse("logout").matches(&t));
+        // multiple words AND together
+        assert!(TaskFilter::parse("fix bug").matches(&t));
+        assert!(!TaskFilter::parse("fix logout").matches(&t));
+
+        assert!(TaskFilter::parse("s:working").matches(&t));
+        assert!(!TaskFilter::parse("s:pending").matches(&t));
+        assert!(TaskFilter::parse("s:pending s:working").matches(&t), "two statuses = any of them");
+        assert!(TaskFilter::parse("p:high").matches(&t));
+        assert!(!TaskFilter::parse("p:low").matches(&t));
+
+        // full conjunction
+        assert!(TaskFilter::parse("#auth s:working p:high login").matches(&t));
+        assert!(!TaskFilter::parse("#auth s:done login").matches(&t));
+
+        // case-insensitive tags/words
+        assert!(TaskFilter::parse("#AUTH Login").matches(&t));
     }
 
     #[test]

@@ -3,16 +3,57 @@
 use crate::task::{parse_due_date, parse_priority, parse_tags, Priority, Status, SubStatus, Subtask, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, io};
+use std::path::Path;
+use std::{fs, io, io::Write};
 
 pub const TASKS_FILE: &str = "tasks.md";
 pub const PROJECTS_DIR: &str = "projects";
 pub const CONFIG_FILE: &str = ".grit.json";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+// Write via temp file + rename so a crash mid-write can never leave a
+// truncated target file. The temp file lives in the same directory (so the
+// rename stays on one filesystem) and is always cleaned up.
+pub fn write_atomic(path: &str, content: &str) -> io::Result<()> {
+    let target = Path::new(path);
+    let tmp = target.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    match fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn default_commit_template() -> String {
+    "TCR: {task}".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GritConfig {
     #[serde(default)]
     pub test_command: String,
+    #[serde(default = "default_commit_template")]
+    pub commit_template: String,
+    #[serde(default)]
+    pub auto_tcr: bool,
+}
+
+// Manual Default so a fresh config carries the real template default
+// (derive(Default) would give an empty string).
+impl Default for GritConfig {
+    fn default() -> Self {
+        GritConfig {
+            test_command: String::new(),
+            commit_template: default_commit_template(),
+            auto_tcr: false,
+        }
+    }
 }
 
 // Load .grit.json from the repo root. Missing or corrupt file → defaults.
@@ -32,11 +73,16 @@ pub fn save_config(cfg: &GritConfig) -> io::Result<()> {
 }
 
 pub fn save_config_to(cfg: &GritConfig, path: &str) -> io::Result<()> {
-    fs::write(path, serde_json::to_string_pretty(cfg)?)
+    write_atomic(path, &serde_json::to_string_pretty(cfg)?)
 }
 
 pub fn load_tasks() -> Vec<Task> {
     load_tasks_from(TASKS_FILE)
+}
+
+// Current on-disk content of a file, empty when it doesn't exist.
+pub fn file_content(path: &str) -> String {
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 // Leading whitespace width: spaces count 1, a tab counts 2.
@@ -193,7 +239,7 @@ pub fn save_tasks_to(tasks: &[Task], path: &str) -> io::Result<()> {
         content.push('\n');
     }
 
-    fs::write(path, content)?;
+    write_atomic(path, &content)?;
     Ok(())
 }
 
@@ -209,7 +255,7 @@ fn write_subtasks(content: &mut String, subs: &[Subtask], indent: usize) {
 pub fn export_to_json(tasks: &[Task], path: &str) -> io::Result<()> {
     let json = serde_json::to_string_pretty(tasks)
         .map_err(io::Error::other)?;
-    fs::write(path, json)?;
+    write_atomic(path, &json)?;
     Ok(())
 }
 
@@ -483,7 +529,7 @@ mod tests {
         assert!(cfg.test_command.is_empty());
 
         // Save then load
-        save_config_to(&GritConfig { test_command: "cargo test".into() }, config_str).unwrap();
+        save_config_to(&GritConfig { test_command: "cargo test".into(), ..GritConfig::default() }, config_str).unwrap();
         assert!(config_path.exists());
         let cfg = load_config_from(config_str);
         assert_eq!(cfg.test_command, "cargo test");
@@ -493,6 +539,43 @@ mod tests {
         let cfg = load_config_from(config_str);
         assert!(cfg.test_command.is_empty());
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_creates_file_with_exact_content_and_no_leftovers() {
+        let dir = std::env::temp_dir().join("grit-test-atomic-create");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        let path_str = path.to_str().unwrap();
+
+        write_atomic(path_str, "hello atomic").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello atomic");
+        // Only the target file may exist — an interrupted write must never
+        // leave a stray temp file in the directory.
+        let leftovers: Vec<String> = fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| *n != "out.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_completely() {
+        let dir = std::env::temp_dir().join("grit-test-atomic-replace");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.txt");
+        let path_str = path.to_str().unwrap();
+
+        // New content is SHORTER than old — a non-atomic truncating write
+        // would leave a mixed/tail-carryover file, atomic replace must not.
+        write_atomic(path_str, "a long old line of saved task data").unwrap();
+        write_atomic(path_str, "short").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "short");
         fs::remove_dir_all(&dir).unwrap();
     }
 

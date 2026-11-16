@@ -27,13 +27,11 @@ A terminal user interface (TUI) task manager built with Rust and ratatui, design
 - Press `Ctrl+r` to redo an undone change.
 - Up to 50 undo/redo levels are kept in memory per session; any new change discards the redo history.
 
-### Search and filter
+### Search, filter and sort
 - Press `/` to open a live search bar — the list filters as you type by description or tag.
-- Press `Esc` to clear the search and return to the full list.
-
-### Sorting
+- Press `f` for a structured **filter**: `#tag`, `s:pending|working|done`, `p:high|medium|low`, plus plain description words. All conditions AND together; `Esc` clears the filter (then the search).
 - Press `S` to cycle through sort modes: **Default → Status → Priority → Due Date → Created**.
-- The active sort mode is shown in the header bar.
+- The active filter and sort mode are shown in the header bar / list title.
 
 ### Multiple projects
 - Press `P` and type a project name to switch to a separate task list saved as `projects/<name>.md`.
@@ -43,11 +41,18 @@ A terminal user interface (TUI) task manager built with Rust and ratatui, design
 ### Git and TCR integration
 - **`t`** — runs your configured test command. If tests pass, saves and commits automatically. If tests fail, reverts all changes with `git restore .`. Running tests with no command configured does nothing (it never reverts).
 - **`T`** — set or change the test command (e.g. `cargo test`, `npm test`). The command is run through your shell, so `&&`, pipes and quotes work. It is saved to `.grit.json` and **persists between sessions**.
-- **`c`** — write a custom commit message and commit immediately.
+- **`c`** — commit with a message, **prefilled from your commit template** (editable before committing).
+- **`m`** — edit the commit-message template used by `t` and auto-TCR. Placeholders: `{task}` (focused task's description), `{status}`, `{date}`. Default: `TCR: {task}`. With no focused task, `t` falls back to `TCR: tests passed`.
+- **`A`** — toggle **auto-TCR**: whenever the git working tree changes (you save files in your editor), tests run in the background — pass → automatic commit, fail → the diff is saved as a patch and the tree is reverted. Skipped on a clean tree, while you're typing, and with no test command set.
+- **`r`** — open the **patch browser**: patches saved by failed auto-TCR runs. `Enter` re-applies a patch (`git apply`), `d` deletes it. Failed runs also show the last test output in a panel (`Esc` closes).
 - Commits are **blocked on `main` and `master`** — if you are on either of those branches the commit is refused with a clear message, so you are never accidentally committing TCR changes to your main branch.
-- Task files (`tasks.md`, `tasks.json`, `projects/`) are kept out of commits — only code changes are committed.
+- Task files (`tasks.md`, `tasks.json`, `.grit.json`, `projects/`, `.grit/patches/`) are kept out of commits — only code changes are committed.
 - The current git branch is displayed in the header bar at all times.
 - Press `g` to toggle a panel showing the last four commits.
+
+### Safe persistence
+- All file writes (task lists, config, JSON export) go through **temp-file + atomic rename**, so a crash can never leave a truncated file behind.
+- If `tasks.md` is edited outside the app while it's running, grit detects it and asks: **`d`** reload from disk (your in-memory version stays recoverable with `u`) or **`k`** keep your version and overwrite.
 
 ### Persistence and export
 - Tasks are saved to `tasks.md` (or `projects/<name>.md`) in human-readable Markdown, grouped by status (Working, Pending, Done).
@@ -107,7 +112,8 @@ Fix login bug #bug #auth due:2025-06-01 p:high
 | Key | Action |
 |---|---|
 | `/` | Search / live filter |
-| `Esc` | Clear search |
+| `f` | Structured filter (`#tag`, `s:status`, `p:priority`, words) |
+| `Esc` | Clear TCR panel → filter → search |
 | `S` | Cycle sort mode |
 | `g` | Toggle git log panel |
 | `P` | Switch project |
@@ -116,14 +122,39 @@ Fix login bug #bug #auth due:2025-06-01 p:high
 | Key | Action |
 |---|---|
 | `T` | Set test command |
+| `m` | Edit commit-message template |
 | `t` | Run tests → commit on pass, revert on fail |
-| `c` | Custom commit message and commit |
+| `c` | Custom commit message (prefilled from template) |
+| `A` | Toggle auto-TCR (test+commit/revert on file changes) |
+| `r` | Patch browser — re-apply or delete revert patches |
 
 ### Export
 | Key | Action |
 |---|---|
 | `E` | Export tasks to `tasks.json` |
 | `I` | Import tasks from `tasks.json` (`a` = append with dedupe, `r` = replace) |
+
+---
+
+## Configuration
+
+`.grit.json` (created next to your tasks, in the repo root):
+
+```json
+{
+  "test_command": "cargo test",
+  "commit_template": "TCR: {task}",
+  "auto_tcr": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `test_command` | Shell command run by `t` and auto-TCR (`T` sets it) |
+| `commit_template` | Message template with `{task}`, `{status}`, `{date}` placeholders (`m` sets it) |
+| `auto_tcr` | Whether auto-TCR runs on working-tree changes (`A` toggles it) |
+
+All fields are optional — missing or corrupt files fall back to defaults.
 
 ---
 
