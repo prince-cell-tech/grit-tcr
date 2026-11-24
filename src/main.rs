@@ -2,6 +2,8 @@ mod app;
 mod git;
 mod storage;
 mod task;
+#[cfg(test)]
+mod testutil;
 mod ui;
 
 use crossterm::{

@@ -306,6 +306,7 @@ pub fn is_valid_project_name(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::task::Status;
+    use crate::testutil::TempDir;
 
     #[test]
     fn project_name_validation() {
@@ -330,8 +331,7 @@ mod tests {
         t.subtasks.push(Subtask::new("integration tests".to_string()).unwrap());
         tasks.push(t);
 
-        let dir = std::env::temp_dir().join("grit-test-roundtrip");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-roundtrip");
         let path = dir.join("tasks.md");
         save_tasks_to(&tasks, path.to_str().unwrap()).unwrap();
 
@@ -345,7 +345,6 @@ mod tests {
         assert_eq!(loaded[0].subtasks.len(), 2);
         assert_eq!(loaded[0].subtasks[0].status, SubStatus::Done);
         assert_eq!(loaded[0].subtasks[1].status, SubStatus::Pending);
-        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -355,8 +354,7 @@ mod tests {
 
     #[test]
     fn load_empty_and_malformed_markdown() {
-        let dir = std::env::temp_dir().join("grit-test-malformed");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-malformed");
 
         // Empty file
         let path = dir.join("empty.md");
@@ -375,14 +373,11 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].created_at, "");
         assert_eq!(loaded[0].status, Status::Pending);
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn markdown_metadata_roundtrip() {
-        let dir = std::env::temp_dir().join("grit-test-meta");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-meta");
         let path = dir.join("tasks.md");
         fs::write(&path, "- [~] fix bug #bug #auth due:2030-01-01 p:low\n  created: 2025-01-01\n  - [x] step one\n  - plain step\n").unwrap();
         let loaded = load_tasks_from(path.to_str().unwrap());
@@ -396,13 +391,11 @@ mod tests {
         assert_eq!(t.subtasks.len(), 2);
         assert_eq!(t.subtasks[0].status, SubStatus::Done);
         assert_eq!(t.subtasks[1].status, SubStatus::Pending);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn nested_subtask_markdown_roundtrip() {
-        let dir = std::env::temp_dir().join("grit-test-nested");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-nested");
         let path = dir.join("tasks.md");
 
         let mut t = Task::new("main task".to_string()).unwrap();
@@ -430,14 +423,12 @@ mod tests {
         assert_eq!(c2.subtasks[1].description, "grand2");
         assert_eq!(c2.subtasks[1].subtasks.len(), 1);
         assert_eq!(c2.subtasks[1].subtasks[0].description, "great-grand");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn nested_subtask_legacy_flat_file_parses() {
         // A hand-written file in the OLD format (all subtasks at 2-space indent)
-        let dir = std::env::temp_dir().join("grit-test-legacy");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-legacy");
         let path = dir.join("tasks.md");
         fs::write(&path, "- [ ] main\n  - [x] first\n  - [ ] second\n").unwrap();
         let loaded = load_tasks_from(path.to_str().unwrap());
@@ -447,15 +438,13 @@ mod tests {
         assert_eq!(t.subtasks[0].status, SubStatus::Done);
         assert_eq!(t.subtasks[1].status, SubStatus::Pending);
         assert!(t.subtasks[0].subtasks.is_empty());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn nested_subtask_skipped_indent_clamps_to_parent() {
         // A file that jumps straight to a deep indent with no parent subtask —
         // the line should attach to the closest available parent (task root).
-        let dir = std::env::temp_dir().join("grit-test-skip-indent");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-skip-indent");
         let path = dir.join("tasks.md");
         fs::write(&path, "- [ ] main\n        - [ ] weird deep line\n  - [ ] normal\n").unwrap();
         let loaded = load_tasks_from(path.to_str().unwrap());
@@ -463,7 +452,6 @@ mod tests {
         let t = &loaded[0];
         assert_eq!(t.subtasks.len(), 2); // clamped to root, then normal sibling
         assert_eq!(t.subtasks[0].description, "weird deep line");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -474,8 +462,7 @@ mod tests {
         t.subtasks.push(Subtask::new("sub".to_string()).unwrap());
         tasks.push(t);
 
-        let dir = std::env::temp_dir().join("grit-test-json");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-json");
         let path = dir.join("tasks.json");
         export_to_json(&tasks, path.to_str().unwrap()).unwrap();
 
@@ -486,13 +473,11 @@ mod tests {
         assert_eq!(imported[0].due_date.as_deref(), Some("2030-05-05"));
         assert_eq!(imported[0].created_at, "2026-01-01");
         assert_eq!(imported[0].subtasks.len(), 1);
-        fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn json_import_error_cases() {
-        let dir = std::env::temp_dir().join("grit-test-json-err");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-json-err");
 
         // Missing file
         assert!(import_from_json(dir.join("nope.json").to_str().unwrap()).is_err());
@@ -511,16 +496,13 @@ mod tests {
         let path = dir.join("broken.json");
         fs::write(&path, "[{").unwrap();
         assert!(import_from_json(path.to_str().unwrap()).is_err());
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn config_roundtrip_and_corrupt_tolerance() {
         // Uses absolute paths so the test never touches the process cwd
         // (which would race with the cwd-switching tests in app.rs).
-        let dir = std::env::temp_dir().join("grit-test-config");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-config");
         let config_path = dir.join(".grit.json");
         let config_str = config_path.to_str().unwrap();
 
@@ -538,14 +520,11 @@ mod tests {
         fs::write(&config_path, "{not json").unwrap();
         let cfg = load_config_from(config_str);
         assert!(cfg.test_command.is_empty());
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn atomic_write_creates_file_with_exact_content_and_no_leftovers() {
-        let dir = std::env::temp_dir().join("grit-test-atomic-create");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-atomic-create");
         let path = dir.join("out.txt");
         let path_str = path.to_str().unwrap();
 
@@ -554,19 +533,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello atomic");
         // Only the target file may exist — an interrupted write must never
         // leave a stray temp file in the directory.
-        let leftovers: Vec<String> = fs::read_dir(&dir).unwrap()
+        let leftovers: Vec<String> = fs::read_dir(dir.path()).unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| *n != "out.txt")
             .collect();
         assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn atomic_write_replaces_existing_file_completely() {
-        let dir = std::env::temp_dir().join("grit-test-atomic-replace");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-atomic-replace");
         let path = dir.join("out.txt");
         let path_str = path.to_str().unwrap();
 
@@ -576,16 +553,13 @@ mod tests {
         write_atomic(path_str, "short").unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "short");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn save_empty_tasks_does_not_create_file() {
-        let dir = std::env::temp_dir().join("grit-test-empty-save");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("grit-test-empty-save");
         let path = dir.join("tasks.md");
         save_tasks_to(&[], path.to_str().unwrap()).unwrap();
         assert!(!path.exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

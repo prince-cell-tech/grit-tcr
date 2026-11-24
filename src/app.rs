@@ -594,34 +594,19 @@ impl App {
 mod tests {
     use super::*;
     use crate::task::{Priority, Subtask};
-    use std::sync::{Mutex, MutexGuard};
+    use crate::testutil::TestEnv;
 
-    // chdir is process-wide and tests run in parallel threads, so every test
-    // that switches directories must hold this lock until it is done.
-    static DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    // Build an App without touching the real task files: temporarily chdir into
-    // an empty temp dir. The returned guard keeps other tests from racing on
-    // the process cwd; drop it (or call restore_dir) to restore cwd.
-    fn app_in_temp_dir() -> (App, std::path::PathBuf, MutexGuard<'static, ()>) {
-        let guard = DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let original = std::env::current_dir().unwrap();
-        let dir = std::env::temp_dir().join(format!("grit-test-app-{}", std::process::id()));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        (App::new(), original, guard)
-    }
-
-    fn restore_dir(original: &std::path::Path) {
-        std::env::set_current_dir(original).unwrap();
+    // Build an App without touching the real task files: each test gets its own
+    // temp dir as the process cwd. Dropping the TestEnv restores the cwd and
+    // deletes the dir — even if the test panics.
+    fn app_in_temp_env() -> (App, TestEnv) {
+        let env = TestEnv::new("grit-test-app");
+        (App::new(), env)
     }
 
     #[test]
     fn undo_roundtrip_restores_tasks_and_cursor() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("first".to_string()).unwrap());
         app.tasks.push(Task::new("second".to_string()).unwrap());
         app.selected = 1;
@@ -644,23 +629,21 @@ mod tests {
         // Undo with nothing left on the stack is a no-op message
         app.undo();
         assert_eq!(app.status_msg, "Nothing to undo.");
-        restore_dir(&original);
     }
 
     #[test]
     fn push_undo_caps_stack_at_50() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         for i in 0..60 {
             app.push_undo();
             app.tasks.push(Task::new(format!("t{i}")).unwrap());
         }
         assert_eq!(app.undo_stack.len(), 50);
-        restore_dir(&original);
     }
 
     #[test]
     fn test_command_persists_to_config() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         // Fresh dir → no config → empty command
         assert!(app.test_command.is_empty());
 
@@ -675,12 +658,11 @@ mod tests {
         std::fs::write(".grit.json", "{oops").unwrap();
         let app3 = App::new();
         assert!(app3.test_command.is_empty());
-        restore_dir(&original);
     }
 
     #[test]
     fn undo_redo_roundtrip() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("first".to_string()).unwrap());
 
         // Mutate, undo, redo → task comes back
@@ -694,12 +676,11 @@ mod tests {
         // Redo again is a no-op message
         app.redo();
         assert_eq!(app.status_msg, "Nothing to redo.");
-        restore_dir(&original);
     }
 
     #[test]
     fn redo_restores_cursor_position() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("a".to_string()).unwrap());
         app.tasks.push(Task::new("b".to_string()).unwrap());
 
@@ -713,12 +694,11 @@ mod tests {
         assert_eq!(app.selected, 1);
         app.redo(); // forward again — cursor returns to the pre-undo position (0)
         assert_eq!(app.selected, 0);
-        restore_dir(&original);
     }
 
     #[test]
     fn new_mutation_invalidates_redo() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("a".to_string()).unwrap());
 
         app.push_undo();
@@ -733,12 +713,11 @@ mod tests {
         app.redo();
         assert_eq!(app.status_msg, "Nothing to redo.");
         assert_eq!(app.tasks.len(), 2); // "b" was not lost
-        restore_dir(&original);
     }
 
     #[test]
     fn jump_top_and_bottom_over_nested_tree() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t1 = Task::new("one".to_string()).unwrap();
         let mut sub = Subtask::new("one-a".to_string()).unwrap();
         sub.subtasks.push(Subtask::new("one-a-1".to_string()).unwrap());
@@ -763,12 +742,11 @@ mod tests {
         app.jump_top();
         assert_eq!(app.selected, 0);
         assert_eq!(app.focused, FocusedRow::Task(0));
-        restore_dir(&original);
     }
 
     #[test]
     fn visible_indices_filters_by_description_and_tag() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("fix login #auth".to_string()).unwrap());
         app.tasks.push(Task::new("write docs #meta".to_string()).unwrap());
         app.tasks.push(Task::new("buy milk".to_string()).unwrap());
@@ -784,12 +762,11 @@ mod tests {
         // Empty query → all
         app.search_query.clear();
         assert_eq!(app.visible_indices(), vec![0, 1, 2]);
-        restore_dir(&original);
     }
 
     #[test]
     fn row_focus_conversion_roundtrip() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t1 = Task::new("one".to_string()).unwrap();
         let mut sub = Subtask::new("one-a".to_string()).unwrap();
         sub.subtasks.push(Subtask::new("one-a-1".to_string()).unwrap());
@@ -811,12 +788,11 @@ mod tests {
             assert_eq!(app.focused_to_row_index(&vis), row);
         }
         assert_eq!(app.total_rows(&vis), 5);
-        restore_dir(&original);
     }
 
     #[test]
     fn move_up_down_across_subtasks() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t1 = Task::new("one".to_string()).unwrap();
         let mut sub = Subtask::new("one-a".to_string()).unwrap();
         sub.subtasks.push(Subtask::new("one-a-1".to_string()).unwrap());
@@ -842,12 +818,11 @@ mod tests {
         assert_eq!(app.focused, FocusedRow::Task(0));
         app.move_up(&vis); // at the top, no-op
         assert_eq!(app.focused, FocusedRow::Task(0));
-        restore_dir(&original);
     }
 
     #[test]
     fn focused_subtask_helpers_reach_deep_nesting() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t = Task::new("task".to_string()).unwrap();
         let mut sub = Subtask::new("child".to_string()).unwrap();
         sub.subtasks.push(Subtask::new("grand".to_string()).unwrap());
@@ -868,12 +843,11 @@ mod tests {
         // Out-of-range path → None, no panic
         app.focused = FocusedRow::Subtask(0, vec![5]);
         assert!(app.focused_subtask(&vis).is_none());
-        restore_dir(&original);
     }
 
     #[test]
     fn task_counts() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut a = Task::new("a".to_string()).unwrap();
         a.status = crate::task::Status::Working;
         let b = Task::new("b".to_string()).unwrap();
@@ -883,12 +857,11 @@ mod tests {
         d.status = crate::task::Status::Done;
         app.tasks = vec![a, b, c, d];
         assert_eq!(app.task_counts(), (1, 1, 2));
-        restore_dir(&original);
     }
 
     #[test]
     fn commit_message_substitutes_template_placeholders() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t = Task::new("fix login bug".to_string()).unwrap();
         t.status = Status::Working;
         app.tasks.push(t);
@@ -901,24 +874,22 @@ mod tests {
             msg,
             format!("fix: fix login bug [working] on {}", crate::task::current_date())
         );
-        restore_dir(&original);
     }
 
     #[test]
     fn commit_message_blank_template_defaults_to_tcr_task() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("buy milk".to_string()).unwrap());
         app.commit_template.clear(); // blank → default "TCR: {task}"
         app.focused = FocusedRow::Task(0);
 
         let vis = app.visible_indices();
         assert_eq!(app.build_commit_message(&vis), "TCR: buy milk");
-        restore_dir(&original);
     }
 
     #[test]
     fn commit_message_without_focused_task_uses_fallback() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.commit_template = "fix: {task}".to_string();
         app.tasks.push(Task::new("buy milk".to_string()).unwrap());
 
@@ -932,12 +903,11 @@ mod tests {
         app.focused = FocusedRow::Task(0);
         let vis = app.visible_indices();
         assert_eq!(app.build_commit_message(&vis), "TCR: tests passed");
-        restore_dir(&original);
     }
 
     #[test]
     fn commit_message_for_subtask_focus_uses_parent_task() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         let mut t = Task::new("parent task".to_string()).unwrap();
         t.subtasks.push(Subtask::new("child step".to_string()).unwrap());
         app.tasks.push(t);
@@ -946,12 +916,11 @@ mod tests {
 
         let vis = app.visible_indices();
         assert_eq!(app.build_commit_message(&vis), "TCR: parent task");
-        restore_dir(&original);
     }
 
     #[test]
     fn set_test_command_preserves_other_config_fields() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.set_commit_template("x: {task}".into());
         app.set_test_command("cargo test".into());
 
@@ -963,12 +932,11 @@ mod tests {
         // And the template itself round-trips into a fresh App
         let app2 = App::new();
         assert_eq!(app2.commit_template, "x: {task}");
-        restore_dir(&original);
     }
 
     #[test]
     fn external_edit_detected_only_after_disk_content_changes() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         // Fresh dir, no file yet → nothing external happened
         assert!(!app.detect_external_edit());
 
@@ -979,12 +947,11 @@ mod tests {
         // Someone edits tasks.md outside the app
         std::fs::write("tasks.md", "- [ ] external edit\n").unwrap();
         assert!(app.detect_external_edit());
-        restore_dir(&original);
     }
 
     #[test]
     fn reload_from_disk_pulls_external_tasks_and_keeps_undo_snapshot() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("my task".to_string()).unwrap());
         app.save();
         std::fs::write("tasks.md", "- [ ] external task\n").unwrap();
@@ -997,12 +964,11 @@ mod tests {
         app.undo();
         assert_eq!(app.tasks.len(), 1);
         assert_eq!(app.tasks[0].description, "my task");
-        restore_dir(&original);
     }
 
     #[test]
     fn keep_my_version_overwrites_external_edit() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("my task".to_string()).unwrap());
         app.save();
         std::fs::write("tasks.md", "- [ ] external edit\n").unwrap();
@@ -1013,12 +979,11 @@ mod tests {
         assert!(on_disk.contains("my task"), "disk: {on_disk}");
         assert!(!on_disk.contains("external edit"));
         assert!(!app.detect_external_edit());
-        restore_dir(&original);
     }
 
     #[test]
     fn visible_indices_applies_filter_and_search_together() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("fix login #auth".to_string()).unwrap());           // 0 pending
         let mut docs = Task::new("write docs #meta".to_string()).unwrap();
         docs.status = Status::Working;
@@ -1047,9 +1012,10 @@ mod tests {
         // No filter → search alone, as before
         app.filter_query.clear();
         assert_eq!(app.visible_indices(), vec![2]);
-        restore_dir(&original);
     }
 
+    // The auto-TCR tests run `sh -c true/false`, which only exists on unix.
+    #[cfg(unix)]
     fn run_git(args: &[&str]) {
         let st = std::process::Command::new("git").args(args).status().expect("git must be available");
         assert!(st.success(), "git {args:?} failed");
@@ -1057,7 +1023,7 @@ mod tests {
 
     #[test]
     fn auto_tcr_flag_persists_and_survives_other_config_saves() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         assert!(!app.auto_tcr);
         app.toggle_auto_tcr();
         assert!(app.auto_tcr);
@@ -1069,12 +1035,12 @@ mod tests {
         let mut app3 = App::new();
         app3.set_test_command("cargo test".into());
         assert!(load_config().auto_tcr);
-        restore_dir(&original);
     }
 
     #[test]
+    #[cfg(unix)]
     fn auto_tcr_runs_on_working_tree_change_and_commits_on_pass() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         // A real repo on a non-main branch (commit_tasks refuses main/master)
         run_git(&["init", "-b", "feature"]);
         run_git(&["config", "user.email", "t@t"]);
@@ -1095,9 +1061,13 @@ mod tests {
         app.maybe_start_auto_tcr();
         assert!(app.tcr_running);
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        app.poll_tcr_result();
-        assert!(!app.tcr_running);
+        assert!(
+            crate::testutil::wait_until(std::time::Duration::from_secs(2), || {
+                app.poll_tcr_result();
+                !app.tcr_running
+            }),
+            "background TCR run must finish within 2s"
+        );
         let count = std::process::Command::new("git")
             .args(["rev-list", "--count", "HEAD"]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2", "expected one TCR commit on top of init");
@@ -1106,12 +1076,12 @@ mod tests {
         // snapshot — a follow-up poll must NOT mistake that for new changes.
         app.maybe_start_auto_tcr();
         assert!(!app.tcr_running, "must not refire without new working-tree changes");
-        restore_dir(&original);
     }
 
     #[test]
+    #[cfg(unix)]
     fn auto_tcr_failure_reverts_tree_and_saves_patch() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         run_git(&["init", "-b", "feature"]);
         run_git(&["config", "user.email", "t@t"]);
         run_git(&["config", "user.name", "t"]);
@@ -1127,9 +1097,13 @@ mod tests {
         app.maybe_start_auto_tcr();
         assert!(app.tcr_running);
 
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        app.poll_tcr_result();
-        assert!(!app.tcr_running);
+        assert!(
+            crate::testutil::wait_until(std::time::Duration::from_secs(2), || {
+                app.poll_tcr_result();
+                !app.tcr_running
+            }),
+            "background TCR run must finish within 2s"
+        );
 
         // The tree was reverted to the committed state…
         assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "one\n");
@@ -1140,12 +1114,12 @@ mod tests {
         assert_eq!(patches.len(), 1, "patches: {patches:?}");
         crate::git::delete_patch(&patches[0]).unwrap();
         assert!(crate::git::list_patches().is_empty());
-        restore_dir(&original);
     }
 
     fn write_json_file(name: &str, tasks: &[Task]) -> String {
-        let dir = std::env::temp_dir().join("grit-test-import");
-        std::fs::create_dir_all(&dir).unwrap();
+        // Relative to the test's temp cwd, so it is cleaned up with the env.
+        let dir = std::path::Path::new("imports");
+        std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
         crate::storage::export_to_json(tasks, path.to_str().unwrap()).unwrap();
         path.to_str().unwrap().to_string()
@@ -1153,7 +1127,7 @@ mod tests {
 
     #[test]
     fn import_append_dedupes_and_returns_counts() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("existing one".to_string()).unwrap());
 
         // incoming: one duplicate of "existing one", two new tasks
@@ -1175,12 +1149,11 @@ mod tests {
         // The whole import is one undo step
         app.undo();
         assert_eq!(app.tasks.len(), 1);
-        restore_dir(&original);
     }
 
     #[test]
     fn import_replace_swaps_the_list() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("old task".to_string()).unwrap());
 
         let incoming = vec![Task::new("fresh".to_string()).unwrap()];
@@ -1195,12 +1168,11 @@ mod tests {
         app.undo();
         assert_eq!(app.tasks.len(), 1);
         assert_eq!(app.tasks[0].description, "old task");
-        restore_dir(&original);
     }
 
     #[test]
     fn import_bad_file_is_an_error_and_keeps_tasks() {
-        let (mut app, original, _lock) = app_in_temp_dir();
+        let (mut app, _env) = app_in_temp_env();
         app.tasks.push(Task::new("keep me".to_string()).unwrap());
 
         let err = app.import_tasks("/nonexistent/import.json", false).unwrap_err();
@@ -1208,6 +1180,5 @@ mod tests {
         assert_eq!(app.tasks.len(), 1);
         // No undo snapshot was pushed on failure
         assert!(app.undo_stack.is_empty());
-        restore_dir(&original);
     }
 }
