@@ -437,13 +437,13 @@ fn handle_key(
         Mode::Filter => handle_filter_key(app, key),
         Mode::CommitTemplate => handle_commit_template_key(app, key),
         Mode::PatchBrowser => handle_patch_browser_key(app, key),
-        Mode::Input => handle_add_task_key(app, key),
-        Mode::Edit => handle_edit_task_key(app, key),
-        Mode::Subtask => handle_add_subtask_key(app, key),
+        Mode::AddTask => handle_add_task_key(app, key),
+        Mode::EditTask => handle_edit_task_key(app, key),
+        Mode::AddSubtask => handle_add_subtask_key(app, key),
         Mode::EditSubtask => handle_edit_subtask_key(app, key),
-        Mode::Test => handle_test_command_key(app, key),
+        Mode::SetTestCommand => handle_set_test_command_key(app, key),
         Mode::CommitMsg => handle_commit_msg_key(app, key),
-        Mode::Projects => handle_projects_key(app, key),
+        Mode::SwitchProject => handle_switch_project_key(app, key),
         Mode::Import => handle_import_key(app, key),
         Mode::ImportMerge => handle_import_merge_key(app, key),
     }
@@ -510,7 +510,7 @@ fn handle_view_key(
             let vis = app.visible_indices();
             if !vis.is_empty() {
                 app.input.clear();
-                app.mode = Mode::Subtask;
+                app.mode = Mode::AddSubtask;
             }
         }
         (_, KeyCode::Char('u')) => {
@@ -543,7 +543,7 @@ fn edit_focused(app: &mut App) {
                     Priority::Low => " p:low",
                 };
                 app.input = format!("{}{}{}{}", t.description, tags_str, due_str, pri_str);
-                app.mode = Mode::Edit;
+                app.mode = Mode::EditTask;
             }
         }
         FocusedRow::Subtask(_, _) => {
@@ -577,11 +577,11 @@ fn handle_view_command(
     match key.code {
         KeyCode::Char('a') => {
             app.input.clear();
-            app.mode = Mode::Input;
+            app.mode = Mode::AddTask;
         }
         KeyCode::Char('T') => {
             app.input = app.test_command.clone();
-            app.mode = Mode::Test;
+            app.mode = Mode::SetTestCommand;
         }
         KeyCode::Char('m') => {
             app.input = app.commit_template.clone();
@@ -598,7 +598,6 @@ fn handle_view_command(
             // Prefill with the template-generated message; editable before commit.
             let vis = app.visible_indices();
             app.input = app.build_commit_message(&vis);
-            app.commit_msg_buf.clear();
             app.mode = Mode::CommitMsg;
         }
         KeyCode::Char('E') => export_tasks(app),
@@ -615,7 +614,7 @@ fn handle_view_command(
         KeyCode::Char('P') => {
             app.projects = list_projects();
             app.input.clear();
-            app.mode = Mode::Projects;
+            app.mode = Mode::SwitchProject;
         }
         KeyCode::Char('/') => {
             app.input = app.search_query.clone();
@@ -898,7 +897,7 @@ fn handle_edit_subtask_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_test_command_key(app: &mut App, key: KeyEvent) {
+fn handle_set_test_command_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
             let cmd = std::mem::take(&mut app.input);
@@ -942,7 +941,7 @@ fn handle_commit_msg_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_projects_key(app: &mut App, key: KeyEvent) {
+fn handle_switch_project_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.mode = Mode::View,
         KeyCode::Enter => {

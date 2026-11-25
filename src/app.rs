@@ -23,6 +23,16 @@ fn collect_subtask_paths(subs: &[Subtask], prefix: &[usize], out: &mut Vec<Vec<u
     }
 }
 
+// Path of a project-scoped file. With no project selected, the file lives in
+// the current directory under its default name.
+fn project_path(project: &str, default_name: &str, ext: &str) -> String {
+    if project.is_empty() {
+        default_name.to_string()
+    } else {
+        format!("{}/{}.{}", PROJECTS_DIR, project, ext)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub tasks: Vec<Task>,
@@ -34,15 +44,15 @@ pub struct Snapshot {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Mode {
     View,
-    Input,
-    Edit,
+    AddTask,
+    EditTask,
     EditSubtask,
-    Test,
+    SetTestCommand,
     Search,
-    Subtask,
+    AddSubtask,
     CommitMsg,
     Help,
-    Projects,
+    SwitchProject,
     Import,
     ImportMerge,
     ReloadPrompt,    // task file changed on disk — reload or keep mine?
@@ -56,12 +66,12 @@ impl Mode {
     // Keeping both in one place means a new mode can't get a box without a title.
     pub fn prompt(&self) -> Option<(&'static str, &'static str)> {
         match self {
-            Mode::Input => Some(("Add task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
-            Mode::Edit => Some(("Edit task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
+            Mode::AddTask => Some(("Add task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
+            Mode::EditTask => Some(("Edit task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
             Mode::EditSubtask => Some(("Edit subtask", " Enter to confirm, Esc to cancel")),
-            Mode::Test => Some(("Set test command", " e.g. cargo test")),
+            Mode::SetTestCommand => Some(("Set test command", " e.g. cargo test")),
             Mode::Search => Some(("Search", " filter tasks by description or tag (Esc to clear)")),
-            Mode::Subtask => Some(("Add subtask / child", " Enter to confirm, Esc to cancel")),
+            Mode::AddSubtask => Some(("Add subtask / child", " Enter to confirm, Esc to cancel")),
             Mode::CommitMsg => Some(("Commit message", " Enter to commit, Esc to cancel")),
             Mode::CommitTemplate => Some(("Commit message template", " placeholders: {task} {status} {date}")),
             Mode::ReloadPrompt => Some(("⚠ Task file changed on disk", " d = reload from disk, k = keep my version")),
@@ -101,7 +111,6 @@ pub struct App {
     pub show_git_log: bool,
     pub current_project: String,   // filename without extension; empty = default
     pub projects: Vec<String>,
-    pub commit_msg_buf: String,
     pub status_msg: String,        // ephemeral bottom message
     pub import_path: String,       // staged path for the two-step JSON import prompt
     // Subprocess output is cached so rendering doesn't spawn git commands every frame.
@@ -141,7 +150,6 @@ impl App {
             show_git_log: false,
             current_project: String::new(),
             projects: list_projects(),
-            commit_msg_buf: String::new(),
             status_msg: String::new(),
             import_path: String::new(),
             last_written: crate::storage::file_content(TASKS_FILE),
@@ -213,11 +221,7 @@ impl App {
 
     // Path of the active task file (default tasks.md or projects/<name>.md).
     pub fn tasks_path(&self) -> String {
-        if self.current_project.is_empty() {
-            TASKS_FILE.to_string()
-        } else {
-            format!("{}/{}.md", PROJECTS_DIR, self.current_project)
-        }
+        project_path(&self.current_project, TASKS_FILE, "md")
     }
 
     pub fn save(&mut self) {
@@ -256,12 +260,10 @@ impl App {
             return;
         }
         self.current_project = name.to_string();
-        let path = if name.is_empty() {
-            TASKS_FILE.to_string()
-        } else {
+        let path = project_path(name, TASKS_FILE, "md");
+        if !name.is_empty() {
             std::fs::create_dir_all(PROJECTS_DIR).ok(); // only create when actually needed
-            format!("{}/{}.md", PROJECTS_DIR, name)
-        };
+        }
         self.tasks = load_tasks_from(&path);
         self.selected = 0;
         self.focused = FocusedRow::Task(0);
@@ -271,11 +273,7 @@ impl App {
 
     // Path of the JSON file for the active project (used by export and import).
     pub fn json_path(&self) -> String {
-        if self.current_project.is_empty() {
-            "tasks.json".to_string()
-        } else {
-            format!("{}/{}.json", PROJECTS_DIR, self.current_project)
-        }
+        project_path(&self.current_project, "tasks.json", "json")
     }
 
     // Import tasks from a JSON file. Append dedupes on (description, created_at);
@@ -1664,5 +1662,79 @@ mod tests {
         assert!(app.tasks.is_empty());
         assert!(app.undo_stack.is_empty());
         assert!(app.status_msg.is_empty());
+    }
+
+    // ── project paths (characterization) ───────────────────────────────────
+
+    #[test]
+    fn paths_default_to_the_current_directory_files() {
+        let (app, _env) = app_in_temp_env();
+
+        assert_eq!(app.current_project, "");
+        assert_eq!(app.tasks_path(), "tasks.md");
+        assert_eq!(app.json_path(), "tasks.json");
+    }
+
+    #[test]
+    fn paths_for_a_named_project_live_under_projects_dir() {
+        let (mut app, _env) = app_in_temp_env();
+        app.current_project = "work".to_string();
+
+        assert_eq!(app.tasks_path(), "projects/work.md");
+        assert_eq!(app.json_path(), "projects/work.json");
+    }
+
+    #[test]
+    fn load_project_switches_file_and_resets_cursor() {
+        let (mut app, _env) = app_in_temp_env();
+        std::fs::create_dir_all("projects").unwrap();
+        std::fs::write("projects/work.md", "- [ ] project task\n").unwrap();
+
+        // Cursor/scroll state that must be reset by the switch.
+        app.selected = 3;
+        app.focused = FocusedRow::Task(3);
+        app.scroll_offset = 2;
+
+        app.load_project("  work  "); // trims
+
+        assert_eq!(app.current_project, "work");
+        assert_eq!(app.tasks_path(), "projects/work.md");
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].description, "project task");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.focused, FocusedRow::Task(0));
+        assert_eq!(app.scroll_offset, 0);
+        assert_eq!(
+            app.last_written,
+            std::fs::read_to_string("projects/work.md").unwrap(),
+            "external-edit baseline must follow the new project file"
+        );
+    }
+
+    #[test]
+    fn load_project_with_empty_name_returns_to_default_files() {
+        let (mut app, _env) = app_in_temp_env();
+        std::fs::write("tasks.md", "- [ ] default task\n").unwrap();
+
+        app.current_project = "work".to_string();
+        app.load_project("");
+
+        assert_eq!(app.current_project, "");
+        assert_eq!(app.tasks_path(), "tasks.md");
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].description, "default task");
+    }
+
+    #[test]
+    fn load_project_rejects_invalid_names_without_switching() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks.push(Task::new("keep me".to_string()).unwrap());
+        app.current_project = "keep".to_string();
+
+        app.load_project("../escape");
+
+        assert_eq!(app.status_msg, "Invalid project name: ../escape");
+        assert_eq!(app.current_project, "keep", "project must not switch");
+        assert_eq!(app.tasks.len(), 1, "tasks must not reload");
     }
 }
