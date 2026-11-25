@@ -1,17 +1,17 @@
 [package]
-name = "grit"
-version = "0.8.0"
+name = "grit-tcr"
+version = "0.9.0"
 edition = "2021"
 authors = ["Prince Riwa"]
-description = "A TUI task manager with Git and TCR integration"
+description = "test && commit || revert — in your terminal or as a TUI task manager"
 license = "MIT"
-repository = "https://github.com/prince-cell-tech/grit"
+repository = "https://github.com/prince-cell-tech/grit-tcr"
 readme = "README.md"
-keywords = ["tui", "task", "cli", "tcr"]
-categories = ["command-line-utilities"]
+keywords = ["tcr", "tdd", "tui", "git", "task"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "tasksmanager"
+name = "grit-tcr"
 path = "src/main.rs"
 
 [dependencies]

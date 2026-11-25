@@ -7,6 +7,30 @@ use std::process::Command;
 
 pub const PATCHES_DIR: &str = ".grit/patches";
 
+// grit's own state. These are never committed, never reverted, and never
+// counted as a working-tree change — otherwise grit's own writes drive the
+// TCR loop: saving a task would run your tests, and a failing test would
+// revert the task you just typed.
+pub const OWN_PATHS: [&str; 5] = [TASKS_FILE, "tasks.json", CONFIG_FILE, PROJECTS_DIR, ".grit"];
+
+// Does this path belong to grit rather than to the project?
+fn is_own_path(path: &str) -> bool {
+    let p = path.trim().trim_matches('"');
+    OWN_PATHS
+        .iter()
+        .any(|own| p == *own || p.starts_with(&format!("{own}/")))
+}
+
+// `-- . :(exclude)tasks.md …` — every git command that touches the tree gets
+// these, so grit's own files are out of scope for all of them.
+fn excluding_own_paths() -> Vec<String> {
+    let mut args = vec!["--".to_string(), ".".to_string()];
+    for own in OWN_PATHS {
+        args.push(format!(":(exclude){own}"));
+    }
+    args
+}
+
 pub fn run_test_command(command: &str) -> bool {
     let command = command.trim();
     if command.is_empty() { return false; }
@@ -45,19 +69,66 @@ pub fn working_tree_signature() -> Option<String> {
         .args(["status", "--porcelain"])
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .map(|o| {
+            // Porcelain lines are "XY path"; drop the ones that are grit's own
+            // bookkeeping so they can never trigger a TCR run.
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.len() > 3 && !is_own_path(&l[3..]))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        })
 }
 
-// Revert all tracked working-tree changes (same as the manual `t` failure path).
-pub fn revert_worktree() {
-    let _ = Command::new("git").args(["restore", "."]).status();
-}
-
-// Captured diff of tracked working-tree changes (untracked files are left
-// alone by the revert too, so nothing user-created is ever destroyed).
-pub fn git_diff_all() -> String {
+// True when the current directory is inside a git work tree.
+pub fn in_repo() -> bool {
     Command::new("git")
-        .args(["diff"])
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
+// True when HEAD resolves to a commit. Before the first commit there is no
+// HEAD to restore from, so callers fall back to index-only behaviour.
+fn has_head() -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// Revert all tracked changes back to HEAD — index AND working tree. Staging a
+// change must not let it survive a failed test: a plain `git restore .` only
+// rewrites the working tree from the index, so staged work would quietly
+// become the new baseline and ride along in the next commit.
+pub fn revert_worktree() {
+    let mut args: Vec<String> = if has_head() {
+        ["restore", "--source=HEAD", "--staged", "--worktree"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec!["restore".to_string()]
+    };
+    args.extend(excluding_own_paths());
+    let _ = Command::new("git").args(&args).status();
+}
+
+// Captured diff of tracked changes against HEAD, so staged work is in the
+// patch too — it must be recoverable, because revert_worktree() throws it
+// away. Untracked files are excluded here and spared by the revert, so
+// nothing user-created is ever destroyed.
+pub fn git_diff_all() -> String {
+    let mut args: Vec<String> = if has_head() {
+        vec!["diff".to_string(), "HEAD".to_string()]
+    } else {
+        vec!["diff".to_string()]
+    };
+    args.extend(excluding_own_paths());
+    Command::new("git")
+        .args(&args)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default()
@@ -75,6 +146,15 @@ pub fn save_patch(diff: &str) -> io::Result<PathBuf> {
     }
     std::fs::write(&path, diff)?;
     Ok(path)
+}
+
+// Last failing test output, kept on disk so dismissing the panel — or missing
+// it entirely in watch mode — never loses what actually broke.
+pub const FAILURE_LOG: &str = ".grit/last-failure.log";
+
+pub fn save_failure_log(output: &str) -> io::Result<()> {
+    std::fs::create_dir_all(".grit")?;
+    std::fs::write(FAILURE_LOG, output)
 }
 
 // Saved patch filenames, newest first.
@@ -109,6 +189,21 @@ pub fn delete_patch(name: &str) -> io::Result<()> {
     std::fs::remove_file(Path::new(PATCHES_DIR).join(name))
 }
 
+// One-line error from a failed git command's captured output. Capturing (rather
+// than inheriting stdio) keeps git from writing over the TUI. Some git
+// explanations ("nothing to commit") go to stdout, so fall back to it.
+fn git_error(context: &str, out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = if stderr.trim().is_empty() { &stdout } else { &stderr };
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        context.to_string()
+    } else {
+        format!("{context}: {one_line}")
+    }
+}
+
 pub fn commit_tasks(message: &str) -> Result<(), String> {
     let branch = git_branch();
     if branch == "main" || branch == "master" {
@@ -117,20 +212,24 @@ pub fn commit_tasks(message: &str) -> Result<(), String> {
             branch
         ));
     }
-    let add = Command::new("git").args(["add", "-A"]).status().map_err(|e| e.to_string())?;
-    if !add.success() { return Err("git add failed".to_string()); }
+    let add = Command::new("git").args(["add", "-A"]).output().map_err(|e| e.to_string())?;
+    if !add.status.success() {
+        return Err(git_error("git add failed", &add));
+    }
     // Keep the task-manager's own files out of commits — only code changes belong in them.
     let mut reset_args: Vec<&str> = vec!["reset", "-q", "--"];
-    for p in [TASKS_FILE, "tasks.json", CONFIG_FILE, PROJECTS_DIR, ".grit"] {
+    for p in OWN_PATHS {
         if std::path::Path::new(p).exists() {
             reset_args.push(p);
         }
     }
     if reset_args.len() > 3 {
-        let _ = Command::new("git").args(&reset_args).status();
+        let _ = Command::new("git").args(&reset_args).output();
     }
-    let commit = Command::new("git").args(["commit", "-m", message]).status().map_err(|e| e.to_string())?;
-    if !commit.success() { return Err("git commit failed".to_string()); }
+    let commit = Command::new("git").args(["commit", "-m", message]).output().map_err(|e| e.to_string())?;
+    if !commit.status.success() {
+        return Err(git_error("git commit failed", &commit));
+    }
     Ok(())
 }
 
@@ -331,6 +430,129 @@ mod tests {
         assert_eq!(std::fs::read_to_string("untracked.txt").unwrap(), "keep\n");
     }
 
+    // TCR's whole promise is that only passing code survives. A change that
+    // happened to be staged (by `git add`, or by an editor/tool that stages on
+    // save) must be discarded on failure like any other.
+    #[test]
+    fn revert_worktree_also_discards_staged_changes() {
+        let _env = TestEnv::new("grit-test-git-revert-staged");
+        init_repo("feature");
+        commit_file("code.txt", "one\n", "init");
+
+        std::fs::write("code.txt", "two\n").unwrap();
+        assert!(Command::new("git").args(["add", "code.txt"]).status().unwrap().success());
+
+        revert_worktree();
+
+        assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "one\n");
+        assert_eq!(
+            working_tree_signature().as_deref(),
+            Some(""),
+            "the index must be clean too, or staged work rides along in the next commit"
+        );
+    }
+
+    // Staged work is destroyed by the revert, so it has to be in the patch.
+    #[test]
+    fn staged_changes_are_captured_in_the_patch_and_can_be_reapplied() {
+        let _env = TestEnv::new("grit-test-git-staged-patch");
+        init_repo("feature");
+        commit_file("code.txt", "one\n", "init");
+
+        std::fs::write("code.txt", "two\n").unwrap();
+        assert!(Command::new("git").args(["add", "code.txt"]).status().unwrap().success());
+
+        let diff = git_diff_all();
+        assert!(diff.contains("code.txt"), "staged change missing from diff: {diff}");
+        let patch = save_patch(&diff).unwrap();
+
+        revert_worktree();
+        assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "one\n");
+
+        apply_patch(&patch_name(&patch)).expect("saved patch should restore staged work");
+        assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "two\n");
+    }
+
+    // grit writes tasks.md every time you touch a task. If that counted as a
+    // working-tree change, saving a task would run your tests — and a failing
+    // test would revert the task you just typed, then prompt you about the
+    // file "changing on disk". Its own files have to be invisible to the loop.
+    #[test]
+    fn working_tree_signature_ignores_grits_own_files() {
+        let _env = TestEnv::new("grit-test-git-sig-own");
+        init_repo("feature");
+        commit_file("code.txt", "one\n", "init");
+
+        std::fs::write(TASKS_FILE, "- [ ] a task\n").unwrap();
+        std::fs::write(CONFIG_FILE, "{}").unwrap();
+        std::fs::create_dir_all(PROJECTS_DIR).unwrap();
+        std::fs::write(Path::new(PROJECTS_DIR).join("work.md"), "- [ ] p\n").unwrap();
+        std::fs::create_dir_all(PATCHES_DIR).unwrap();
+        std::fs::write(Path::new(PATCHES_DIR).join("x.patch"), "diff").unwrap();
+
+        assert_eq!(
+            working_tree_signature().as_deref(),
+            Some(""),
+            "grit's own files must not look like a code change"
+        );
+
+        // A real code change still registers.
+        std::fs::write("code.txt", "two\n").unwrap();
+        let sig = working_tree_signature().expect("signature");
+        assert!(sig.contains("code.txt"), "got: {sig:?}");
+        assert!(!sig.contains(TASKS_FILE), "got: {sig:?}");
+    }
+
+    #[test]
+    fn revert_worktree_never_touches_the_task_list() {
+        let _env = TestEnv::new("grit-test-git-revert-own");
+        init_repo("feature");
+        // Someone committed their task list — a perfectly reasonable thing to
+        // do, and it used to mean a failing test deleted their tasks.
+        commit_file("code.txt", "one\n", "init");
+        commit_file(TASKS_FILE, "- [ ] first task\n", "add tasks");
+
+        std::fs::write("code.txt", "two\n").unwrap();
+        std::fs::write(TASKS_FILE, "- [ ] first task\n- [ ] second task\n").unwrap();
+
+        revert_worktree();
+
+        assert_eq!(std::fs::read_to_string("code.txt").unwrap(), "one\n", "code reverts");
+        assert_eq!(
+            std::fs::read_to_string(TASKS_FILE).unwrap(),
+            "- [ ] first task\n- [ ] second task\n",
+            "the task list survives: it is not the project's code"
+        );
+    }
+
+    #[test]
+    fn git_diff_all_excludes_grits_own_files() {
+        let _env = TestEnv::new("grit-test-git-diff-own");
+        init_repo("feature");
+        commit_file("code.txt", "one\n", "init");
+        commit_file(TASKS_FILE, "- [ ] first task\n", "add tasks");
+
+        std::fs::write("code.txt", "two\n").unwrap();
+        std::fs::write(TASKS_FILE, "- [ ] a different task\n").unwrap();
+
+        let diff = git_diff_all();
+        assert!(diff.contains("code.txt"), "diff: {diff}");
+        assert!(
+            !diff.contains(TASKS_FILE),
+            "a revert patch must hold code, not your task list: {diff}"
+        );
+    }
+
+    #[test]
+    fn failure_log_keeps_the_last_output() {
+        let _env = TestEnv::new("grit-test-git-faillog");
+        save_failure_log("assertion failed: 2 + 2 == 5\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(FAILURE_LOG).unwrap(),
+            "assertion failed: 2 + 2 == 5\n"
+        );
+    }
+
     #[test]
     fn commit_tasks_refuses_main_and_master() {
         let _env = TestEnv::new("grit-test-git-main");
@@ -340,6 +562,20 @@ mod tests {
         let err = commit_tasks("TCR: test").unwrap_err();
         assert!(err.contains("Refusing to commit"), "got: {err}");
         assert!(err.contains("main"), "got: {err}");
+    }
+
+    #[test]
+    fn commit_tasks_returns_git_stderr_when_the_commit_fails() {
+        let _env = TestEnv::new("grit-test-git-commit-err");
+        init_repo("feature");
+
+        // Nothing to commit. git's own explanation must be captured and
+        // returned — with inherited stdio it would be printed over the TUI.
+        let err = commit_tasks("TCR: nothing").unwrap_err();
+        assert!(
+            err.contains("nothing to commit") || err.contains("nothing added to commit"),
+            "expected git's explanation, got: {err:?}"
+        );
     }
 
     #[test]

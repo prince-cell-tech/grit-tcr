@@ -8,6 +8,11 @@ use crate::storage::{
 use crate::task::{sorted_indices, Priority, SortMode, Status, SubStatus, Subtask, Task};
 use std::time::{Duration, Instant};
 
+// How often auto-TCR checks the working tree. Deliberately much shorter than
+// the task-file poll: TCR is only worth doing with tight feedback, and two of
+// these have to pass before a change counts as settled.
+pub const TCR_POLL_INTERVAL: Duration = Duration::from_millis(700);
+
 // Recursive row count of a subtask tree: every subtask is one row.
 fn count_subtask_rows(subs: &[Subtask]) -> usize {
     subs.iter().map(|s| 1 + count_subtask_rows(&s.subtasks)).sum()
@@ -119,7 +124,9 @@ pub struct App {
     // Auto-TCR: background test runs triggered by working-tree changes.
     pub tcr_running: bool,
     pub tcr_rx: Option<std::sync::mpsc::Receiver<(bool, String)>>,
-    pub last_tree_sig: Option<String>,   // last seen `git status --porcelain` output
+    pub settle: crate::tcr::Settle,      // debounced working-tree change detection
+    pub tcr_launch_sig: Option<String>,  // tree state when the running tests started
+    pub last_tcr_poll: Instant,          // throttle for auto-TCR tree checks
     pub last_poll: Instant,              // throttle for disk/tree polling
     pub tcr_output_tail: Vec<String>,    // tail of failed test output (panel)
     pub show_tcr_output: bool,
@@ -157,7 +164,10 @@ impl App {
             git_log_cache: (git_log(4), Instant::now()),
             tcr_running: false,
             tcr_rx: None,
-            last_tree_sig: None,
+            // Two stable checks (≈2s apart) before a save counts as finished.
+            settle: crate::tcr::Settle::new(2),
+            tcr_launch_sig: None,
+            last_tcr_poll: Instant::now(),
             last_poll: Instant::now(),
             tcr_output_tail: vec![],
             show_tcr_output: false,
@@ -656,13 +666,40 @@ impl App {
     pub fn toggle_auto_tcr(&mut self) {
         self.auto_tcr = !self.auto_tcr;
         // Re-baseline so toggling on never fires immediately on old dirt.
-        self.last_tree_sig = None;
+        self.settle.reset();
+        // Switching off has to mean off *now*: a verdict already in flight
+        // would otherwise still commit or revert, which is the opposite of
+        // what someone reaching for this key wants.
+        let cancelled = !self.auto_tcr && self.cancel_tcr_run();
         self.persist_config();
         self.status_msg = if self.auto_tcr {
             "Auto-TCR on: tests run+commit/revert when files change.".to_string()
+        } else if cancelled {
+            "Auto-TCR off. Run in flight discarded — nothing will be committed or reverted.".to_string()
         } else {
             "Auto-TCR off.".to_string()
         };
+    }
+
+    // Forget a running test run. The test process itself can't be killed
+    // portably, so it finishes in the background; dropping the receiver means
+    // its result is never acted on. True when there was something to cancel.
+    pub fn cancel_tcr_run(&mut self) -> bool {
+        if !self.tcr_running && self.tcr_rx.is_none() {
+            return false;
+        }
+        self.tcr_rx = None;
+        self.tcr_running = false;
+        self.tcr_launch_sig = None;
+        true
+    }
+
+    // Is it time to check the working tree for auto-TCR? Lives here, not in
+    // the event loop, so the interval is testable without a terminal.
+    pub fn due_for_tcr_poll(&self) -> bool {
+        self.auto_tcr
+            && self.mode == Mode::View
+            && self.last_tcr_poll.elapsed() >= TCR_POLL_INTERVAL
     }
 
     // Called (throttled) from the event loop: watches the working tree and
@@ -670,14 +707,13 @@ impl App {
     pub fn maybe_start_auto_tcr(&mut self) {
         if self.tcr_running { return; }
         let Some(sig) = crate::git::working_tree_signature() else {
-            self.last_tree_sig = None; // not a repo (yet)
+            self.settle.reset(); // not a repo (yet)
             return;
         };
-        if self.last_tree_sig.as_deref() == Some(sig.as_str()) { return; }
-        let is_baseline = self.last_tree_sig.is_none();
-        self.last_tree_sig = Some(sig.clone());
-        // Baseline poll and a clean tree never trigger a run.
-        if is_baseline || sig.trim().is_empty() { return; }
+        // Fires only once the change has held still — an editor save lands over
+        // several hundred milliseconds, and testing a half-written tree would
+        // revert the part that hadn't been written yet.
+        if !self.settle.observe(&sig) { return; }
         self.start_tcr_run();
     }
 
@@ -687,6 +723,9 @@ impl App {
             self.status_msg = "Auto-TCR skipped: no test command set (press T).".to_string();
             return;
         }
+        // Remembered so the result can be thrown away if the tree moved on
+        // while the tests were running.
+        self.tcr_launch_sig = crate::git::working_tree_signature();
         let (tx, rx) = std::sync::mpsc::channel();
         self.tcr_rx = Some(rx);
         self.tcr_running = true;
@@ -705,6 +744,22 @@ impl App {
         let Some((passed, output)) = result else { return };
         self.tcr_running = false;
         self.tcr_rx = None;
+
+        // The tests judged the tree as it was when they started. If files
+        // changed since, this verdict belongs to code that no longer exists:
+        // committing it would commit untested work, and reverting would
+        // destroy edits the tests never saw. Test again instead.
+        let now_sig = crate::git::working_tree_signature();
+        if now_sig != self.tcr_launch_sig {
+            self.settle.accept(now_sig);
+            self.start_tcr_run();
+            // After start_tcr_run, which sets its own "TCR running…" message.
+            if self.tcr_running {
+                self.status_msg = "Auto-TCR: files changed mid-run — re-testing.".to_string();
+            }
+            return;
+        }
+
         if passed {
             self.save();
             let vis = self.visible_indices();
@@ -725,6 +780,7 @@ impl App {
                 crate::git::save_patch(&diff).ok()
             };
             crate::git::revert_worktree();
+            let _ = crate::git::save_failure_log(&output);
             self.tcr_output_tail = output.lines()
                 .rev().take(15).collect::<Vec<_>>().into_iter().rev()
                 .map(|s| s.to_string()).collect();
@@ -736,7 +792,8 @@ impl App {
         }
         // The tree just changed (commit or revert) — re-baseline so the next
         // poll doesn't mistake our own action for new editor changes.
-        self.last_tree_sig = crate::git::working_tree_signature();
+        self.settle.accept(crate::git::working_tree_signature());
+        self.tcr_launch_sig = None;
     }
 }
 
@@ -1189,6 +1246,190 @@ mod tests {
         assert!(load_config().auto_tcr);
     }
 
+    // Auto-TCR waits for the tree to stop moving, so a settled change needs
+    // more than one poll before the run actually starts.
+    fn poll_until_tcr_starts(app: &mut App) {
+        for _ in 0..5 {
+            app.maybe_start_auto_tcr();
+            if app.tcr_running {
+                return;
+            }
+        }
+        panic!("auto-TCR never started after a settled change");
+    }
+
+    #[test]
+    fn tcr_poll_is_due_only_when_idle_with_auto_tcr_on() {
+        let (mut app, _env) = app_in_temp_env();
+        assert!(!app.due_for_tcr_poll(), "auto-TCR is off by default");
+
+        app.auto_tcr = true;
+        assert!(!app.due_for_tcr_poll(), "not due until the interval has passed");
+
+        // Pretend the interval elapsed.
+        app.last_tcr_poll = Instant::now() - TCR_POLL_INTERVAL;
+        assert!(app.due_for_tcr_poll());
+
+        // A prompt is open: don't check the tree mid-keystroke.
+        app.mode = Mode::AddTask;
+        assert!(!app.due_for_tcr_poll());
+        app.mode = Mode::View;
+        assert!(app.due_for_tcr_poll());
+
+        app.auto_tcr = false;
+        assert!(!app.due_for_tcr_poll());
+    }
+
+    #[test]
+    fn tcr_poll_interval_stays_tight_enough_to_be_a_feedback_loop() {
+        // Two intervals must pass before a change counts as settled, so this
+        // bounds how long a save waits. Over a second each and TCR stops
+        // feeling like a loop at all.
+        assert!(
+            TCR_POLL_INTERVAL <= Duration::from_millis(1000),
+            "auto-TCR poll is too slow: {TCR_POLL_INTERVAL:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn toggling_auto_tcr_off_discards_a_run_in_flight() {
+        let (mut app, _env) = app_in_temp_env();
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("code.txt", "one\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        // Fails, but slowly enough to change your mind during.
+        app.set_test_command("sleep 0.4; false".into());
+        app.toggle_auto_tcr();
+        app.maybe_start_auto_tcr(); // baseline
+        std::fs::write("code.txt", "one\ntwo\n").unwrap();
+        poll_until_tcr_starts(&mut app);
+
+        app.toggle_auto_tcr(); // off, mid-run
+        assert!(!app.tcr_running, "the run must be forgotten immediately");
+        assert!(app.status_msg.contains("discarded"), "got: {:?}", app.status_msg);
+
+        // Let the abandoned test process finish, polling as the loop would.
+        assert!(
+            !crate::testutil::wait_until(std::time::Duration::from_millis(900), || {
+                app.poll_tcr_result();
+                app.tcr_running
+            }),
+            "a cancelled run must never resume"
+        );
+        assert_eq!(
+            std::fs::read_to_string("code.txt").unwrap(),
+            "one\ntwo\n",
+            "work must survive: the verdict was abandoned before it landed"
+        );
+        assert!(crate::git::list_patches().is_empty(), "nothing was reverted, so no patch");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn editing_tasks_never_triggers_a_tcr_run() {
+        let (mut app, _env) = app_in_temp_env();
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("code.txt", "one\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        app.set_test_command("false".into()); // would revert if it ever ran
+        app.toggle_auto_tcr();
+        app.maybe_start_auto_tcr(); // baseline
+
+        // Add a task, the way pressing `a` does: this writes tasks.md.
+        app.tasks.push(Task::new("second task".to_string()).unwrap());
+        app.save();
+
+        for _ in 0..4 {
+            app.maybe_start_auto_tcr();
+        }
+        assert!(
+            !app.tcr_running,
+            "writing the task list is grit's own bookkeeping, not a code change"
+        );
+        assert!(
+            std::fs::read_to_string(TASKS_FILE).unwrap().contains("second task"),
+            "the task must still be on disk"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_tcr_waits_for_a_save_to_finish_before_testing() {
+        let (mut app, _env) = app_in_temp_env();
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("a.txt", "1\n").unwrap();
+        std::fs::write("b.txt", "1\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        app.set_test_command("true".into());
+        app.toggle_auto_tcr();
+        app.maybe_start_auto_tcr(); // baseline: clean
+
+        // A multi-file save in progress: the tree looks different on each poll.
+        std::fs::write("a.txt", "2\n").unwrap();
+        app.maybe_start_auto_tcr();
+        assert!(!app.tcr_running, "must not test a tree that is still being written");
+        std::fs::write("c.txt", "new\n").unwrap();
+        app.maybe_start_auto_tcr();
+        assert!(!app.tcr_running, "still moving — still must not test");
+
+        // The save finished: the tree looks the same twice in a row.
+        app.maybe_start_auto_tcr();
+        assert!(app.tcr_running, "a settled change must start a run");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_tcr_retests_instead_of_judging_a_tree_that_moved_mid_run() {
+        let (mut app, _env) = app_in_temp_env();
+        run_git(&["init", "-b", "feature"]);
+        run_git(&["config", "user.email", "t@t"]);
+        run_git(&["config", "user.name", "t"]);
+        std::fs::write("a.txt", "1\n").unwrap();
+        std::fs::write("b.txt", "1\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        // Fails, but slowly enough to type during.
+        app.set_test_command("sleep 0.4; false".into());
+        app.toggle_auto_tcr();
+        app.maybe_start_auto_tcr(); // baseline
+        std::fs::write("a.txt", "2\n").unwrap();
+        poll_until_tcr_starts(&mut app);
+
+        // An edit that lands while the tests are still running. The failure
+        // they report is about code from before it, so it must not be reverted.
+        std::fs::write("b.txt", "typed during the run\n").unwrap();
+
+        assert!(
+            crate::testutil::wait_until(std::time::Duration::from_secs(3), || {
+                app.poll_tcr_result();
+                app.status_msg.contains("re-testing")
+            }),
+            "a verdict on a stale tree must be discarded, got: {:?}",
+            app.status_msg
+        );
+        assert_eq!(
+            std::fs::read_to_string("b.txt").unwrap(),
+            "typed during the run\n",
+            "work typed during the run must survive a failure it had no part in"
+        );
+        assert!(app.tcr_running, "a fresh run must be underway");
+        assert!(crate::git::list_patches().is_empty(), "nothing was reverted, so no patch");
+    }
+
     #[test]
     #[cfg(unix)]
     fn auto_tcr_runs_on_working_tree_change_and_commits_on_pass() {
@@ -1208,10 +1449,9 @@ mod tests {
         app.maybe_start_auto_tcr();
         assert!(!app.tcr_running, "clean tree must not trigger TCR");
 
-        // A file save (dirty tree) triggers the run
+        // A file save (dirty tree) triggers the run, once it has held still
         std::fs::write("code.txt", "one\ntwo\n").unwrap();
-        app.maybe_start_auto_tcr();
-        assert!(app.tcr_running);
+        poll_until_tcr_starts(&mut app);
 
         assert!(
             crate::testutil::wait_until(std::time::Duration::from_secs(2), || {
@@ -1246,8 +1486,7 @@ mod tests {
 
         app.maybe_start_auto_tcr(); // baseline
         std::fs::write("code.txt", "one\ntwo\n").unwrap();
-        app.maybe_start_auto_tcr();
-        assert!(app.tcr_running);
+        poll_until_tcr_starts(&mut app);
 
         assert!(
             crate::testutil::wait_until(std::time::Duration::from_secs(2), || {

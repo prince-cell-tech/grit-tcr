@@ -301,11 +301,19 @@ fn render_git_log(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_tcr_panel(f: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = app.tcr_output_tail.iter().map(|l| Line::from(l.as_str())).collect();
+    // Show the END of the output. On a short terminal the panel gets less room
+    // than it asked for, and the last line — "FAILED", the assertion, the exit
+    // status — is the one worth seeing, so clip from the top, not the bottom.
+    let room = area.height.saturating_sub(2).max(1) as usize;
+    let start = app.tcr_output_tail.len().saturating_sub(room);
+    let lines: Vec<Line> = app.tcr_output_tail[start..]
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
     let panel = Paragraph::new(lines)
         .block(
             Block::default()
-                .title("TCR failed — last output (Esc to close)")
+                .title("TCR failed (any key to dismiss)")
                 .borders(Borders::ALL),
         )
         .style(Style::default().fg(Color::Red));
@@ -387,15 +395,21 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<
         // Non-blocking: collect a finished background auto-TCR run.
         app.poll_tcr_result();
 
-        // Throttled polling (every 2s): external task-file edits → prompt;
-        // working-tree changes → auto-TCR run (only while idle in View).
+        // External task-file edits: noticing these a second late costs
+        // nothing, so they stay on the slow poll.
         if app.mode == Mode::View && app.last_poll.elapsed() >= Duration::from_secs(2) {
             app.last_poll = Instant::now();
             if app.detect_external_edit() {
                 app.mode = Mode::ReloadPrompt;
-            } else if app.auto_tcr {
-                app.maybe_start_auto_tcr();
             }
+        }
+
+        // Working-tree changes: polled far more often, because a TCR loop that
+        // takes seconds to notice a save isn't a feedback loop. Skipped once a
+        // prompt is open, so the check never fires mid-keystroke.
+        if app.due_for_tcr_poll() {
+            app.last_tcr_poll = Instant::now();
+            app.maybe_start_auto_tcr();
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -423,6 +437,11 @@ fn handle_key(
 
     // Clear ephemeral status on any key
     app.status_msg.clear();
+
+    // The failure panel is ephemeral too. It used to need Esc, which left it
+    // sitting there through everything else you did; the full output is kept
+    // in .grit/last-failure.log, so dismissing it loses nothing.
+    app.show_tcr_output = false;
 
     // Ctrl+C always quits, from any mode
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -667,8 +686,19 @@ fn run_tests_and_commit(
             Err(e) => println!("Not committed: {}", e),
         }
     } else {
-        println!("Tests failed, reverting...");
+        // Same safety net as auto-TCR: capture the diff BEFORE reverting, so a
+        // manual `t` failure is recoverable from the patch browser (`r`) too.
+        let diff = crate::git::git_diff_all();
+        let patch = if diff.trim().is_empty() {
+            None
+        } else {
+            crate::git::save_patch(&diff).ok()
+        };
         crate::git::revert_worktree();
+        match patch {
+            Some(p) => println!("Tests failed, reverted. Patch saved: {} (press r to re-apply)", p.display()),
+            None => println!("Tests failed, nothing to revert."),
+        }
     }
     println!("Press Enter to return...");
     let _ = io::stdin().read_line(&mut String::new());
