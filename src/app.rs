@@ -5,7 +5,7 @@ use crate::storage::{
     is_valid_project_name, list_projects, load_config, load_tasks, load_tasks_from,
     save_config, save_tasks_to, GritConfig, PROJECTS_DIR, TASKS_FILE,
 };
-use crate::task::{sorted_indices, Status, Subtask, Task, SortMode};
+use crate::task::{sorted_indices, Priority, SortMode, Status, SubStatus, Subtask, Task};
 use std::time::{Duration, Instant};
 
 // Recursive row count of a subtask tree: every subtask is one row.
@@ -49,6 +49,28 @@ pub enum Mode {
     Filter,          // structured filter prompt (f)
     CommitTemplate,  // edit commit-message template (m)
     PatchBrowser,    // browse/apply/delete revert patches (r)
+}
+
+impl Mode {
+    // Title and hint for the input box, or None when this mode has no prompt.
+    // Keeping both in one place means a new mode can't get a box without a title.
+    pub fn prompt(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Mode::Input => Some(("Add task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
+            Mode::Edit => Some(("Edit task", " syntax: description #tag due:YYYY-MM-DD p:high|medium|low")),
+            Mode::EditSubtask => Some(("Edit subtask", " Enter to confirm, Esc to cancel")),
+            Mode::Test => Some(("Set test command", " e.g. cargo test")),
+            Mode::Search => Some(("Search", " filter tasks by description or tag (Esc to clear)")),
+            Mode::Subtask => Some(("Add subtask / child", " Enter to confirm, Esc to cancel")),
+            Mode::CommitMsg => Some(("Commit message", " Enter to commit, Esc to cancel")),
+            Mode::CommitTemplate => Some(("Commit message template", " placeholders: {task} {status} {date}")),
+            Mode::ReloadPrompt => Some(("⚠ Task file changed on disk", " d = reload from disk, k = keep my version")),
+            Mode::Filter => Some(("Filter", " #tag  s:pending|working|done  p:high|medium|low  + plain words (Esc exits)")),
+            Mode::Import => Some(("Import tasks", " path to tasks.json (blank = this project's JSON), Enter to continue")),
+            Mode::ImportMerge => Some(("Import tasks", " how to merge? a = append (dedupe), r = replace, Esc to cancel")),
+            _ => None,
+        }
+    }
 }
 
 // Which row the cursor is on — a task header or one of its subtasks
@@ -335,6 +357,138 @@ impl App {
         } else if self.selected >= vis_len {
             self.selected = vis_len - 1;
             self.focused = FocusedRow::Task(self.selected);
+        }
+    }
+
+    // Delete the focused task or subtask. Focus moves to a predictable row so
+    // repeated `d` presses keep deleting near where the user is looking.
+    pub fn delete_focused(&mut self, vis: &[usize]) {
+        if vis.is_empty() {
+            return;
+        }
+        let vis_len = vis.len();
+        match self.focused.clone() {
+            FocusedRow::Task(di) => {
+                let real = vis[di];
+                self.push_undo();
+                self.tasks.remove(real);
+                self.focused = FocusedRow::Task(0);
+                self.selected = 0;
+                self.clamp_selected(vis_len.saturating_sub(1));
+                self.save();
+                self.status_msg = "Task deleted. Press u to undo.".to_string();
+            }
+            FocusedRow::Subtask(di, path) => {
+                let real = vis[di];
+                self.push_undo();
+                // Remove via the parent path; focus moves back to the parent
+                // subtask (or task) when no siblings remain.
+                let parent = path[..path.len() - 1].to_vec();
+                let idx = path[path.len() - 1];
+                {
+                    let task = &mut self.tasks[real];
+                    match crate::task::subtask_mut_at(task, &parent) {
+                        Some(p) => { let _ = p.subtasks.remove(idx); }
+                        None => { let _ = task.subtasks.remove(idx); }
+                    }
+                }
+                self.focused = if parent.is_empty() {
+                    FocusedRow::Task(di)
+                } else {
+                    let siblings = crate::task::subtask_at(&self.tasks[real], &parent)
+                        .map(|p| p.subtasks.len())
+                        .unwrap_or(0);
+                    if siblings == 0 {
+                        // Parent now childless → focus the parent itself
+                        FocusedRow::Subtask(di, parent)
+                    } else {
+                        FocusedRow::Subtask(di, {
+                            let mut p = parent.clone();
+                            p.push(idx.min(siblings - 1));
+                            p
+                        })
+                    }
+                };
+                self.save();
+                self.status_msg = "Subtask deleted. Press u to undo.".to_string();
+            }
+        }
+    }
+
+    // Add a subtask under the focused row: a task gets a new top-level
+    // subtask, a subtask gets a nested child. Returns whether it was added.
+    pub fn add_subtask(&mut self, vis: &[usize], text: &str) -> bool {
+        let Some(sub) = Subtask::new(text.to_string()) else {
+            self.status_msg = "Subtask description cannot be empty.".to_string();
+            return false;
+        };
+        let parent_di = match &self.focused {
+            FocusedRow::Task(di) => *di,
+            FocusedRow::Subtask(di, _) => *di,
+        };
+        let Some(&real) = vis.get(parent_di) else { return false };
+
+        self.push_undo();
+        let parent_path: Vec<usize> = match &self.focused {
+            FocusedRow::Task(_) => vec![],
+            FocusedRow::Subtask(_, path) => path.clone(),
+        };
+        match parent_path.as_slice() {
+            [] => self.tasks[real].subtasks.push(sub),
+            p => {
+                if let Some(parent) = crate::task::subtask_mut_at(&mut self.tasks[real], p) {
+                    parent.subtasks.push(sub);
+                } else {
+                    self.tasks[real].subtasks.push(sub);
+                }
+            }
+        }
+        self.save();
+        self.status_msg = "Subtask added.".to_string();
+        true
+    }
+
+    // Cycle the focused task's priority: High→Medium→Low→High. Subtask rows
+    // have no priority of their own, so the key is a no-op there.
+    pub fn cycle_focused_priority(&mut self, vis: &[usize]) {
+        if let FocusedRow::Task(di) = self.focused.clone() {
+            if let Some(&real) = vis.get(di) {
+                self.push_undo();
+                self.tasks[real].priority = match self.tasks[real].priority {
+                    Priority::High => Priority::Medium,
+                    Priority::Medium => Priority::Low,
+                    Priority::Low => Priority::High,
+                };
+                self.save();
+            }
+        }
+    }
+
+    // Cycle the focused row's status: tasks Pending→Done→Working→Pending,
+    // subtasks Pending↔Done.
+    pub fn toggle_focused_status(&mut self, vis: &[usize]) {
+        match self.focused.clone() {
+            FocusedRow::Task(di) => {
+                if let Some(&real) = vis.get(di) {
+                    self.push_undo();
+                    self.tasks[real].status = match self.tasks[real].status {
+                        Status::Pending => Status::Done,
+                        Status::Done => Status::Working,
+                        Status::Working => Status::Pending,
+                    };
+                    self.save();
+                }
+            }
+            FocusedRow::Subtask(_, _) => {
+                self.push_undo();
+                if let Some(sub) = self.focused_subtask_mut(vis) {
+                    sub.status = match sub.status {
+                        SubStatus::Pending => SubStatus::Done,
+                        SubStatus::Done => SubStatus::Pending,
+                    };
+                }
+                self.save();
+            }
         }
     }
 
@@ -1180,5 +1334,335 @@ mod tests {
         assert_eq!(app.tasks.len(), 1);
         // No undo snapshot was pushed on failure
         assert!(app.undo_stack.is_empty());
+    }
+
+    // ── delete_focused ──────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_task_removes_it_and_resets_focus() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![
+            Task::new("a".to_string()).unwrap(),
+            Task::new("b".to_string()).unwrap(),
+            Task::new("c".to_string()).unwrap(),
+        ];
+        app.focused = FocusedRow::Task(1);
+        let vis = app.visible_indices();
+
+        app.delete_focused(&vis);
+
+        assert_eq!(app.tasks.len(), 2);
+        assert_eq!(app.tasks[0].description, "a");
+        assert_eq!(app.tasks[1].description, "c");
+        assert_eq!(app.focused, FocusedRow::Task(0));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.status_msg, "Task deleted. Press u to undo.");
+
+        app.undo();
+        assert_eq!(app.tasks.len(), 3, "delete must be undoable");
+    }
+
+    #[test]
+    fn delete_top_level_subtask_focuses_parent_task() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        t.subtasks = vec![
+            Subtask::new("first".to_string()).unwrap(),
+            Subtask::new("second".to_string()).unwrap(),
+        ];
+        app.tasks = vec![t];
+        app.focused = FocusedRow::Subtask(0, vec![0]);
+        let vis = app.visible_indices();
+
+        app.delete_focused(&vis);
+
+        assert_eq!(app.tasks[0].subtasks.len(), 1);
+        assert_eq!(app.tasks[0].subtasks[0].description, "second");
+        assert_eq!(app.focused, FocusedRow::Task(0));
+        assert_eq!(app.status_msg, "Subtask deleted. Press u to undo.");
+    }
+
+    #[test]
+    fn delete_nested_subtask_focuses_next_sibling_then_previous() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        let mut child = Subtask::new("child".to_string()).unwrap();
+        child.subtasks = vec![
+            Subtask::new("g1".to_string()).unwrap(),
+            Subtask::new("g2".to_string()).unwrap(),
+            Subtask::new("g3".to_string()).unwrap(),
+        ];
+        t.subtasks = vec![child];
+        app.tasks = vec![t];
+
+        // Delete the middle grandchild: focus lands on the next sibling (g3).
+        app.focused = FocusedRow::Subtask(0, vec![0, 1]);
+        let vis = app.visible_indices();
+        app.delete_focused(&vis);
+
+        assert_eq!(app.tasks[0].subtasks[0].subtasks.len(), 2);
+        assert_eq!(app.tasks[0].subtasks[0].subtasks[0].description, "g1");
+        assert_eq!(app.tasks[0].subtasks[0].subtasks[1].description, "g3");
+        assert_eq!(
+            app.focused,
+            FocusedRow::Subtask(0, vec![0, 1]),
+            "focus follows the next sibling"
+        );
+
+        // Delete the last remaining sibling: focus clamps back to the previous.
+        let vis = app.visible_indices();
+        app.delete_focused(&vis);
+        assert_eq!(app.tasks[0].subtasks[0].subtasks.len(), 1);
+        assert_eq!(
+            app.focused,
+            FocusedRow::Subtask(0, vec![0, 0]),
+            "focus stays at depth and clamps to the previous sibling"
+        );
+    }
+
+    #[test]
+    fn delete_last_child_focuses_the_parent_subtask() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        let mut child = Subtask::new("child".to_string()).unwrap();
+        child.subtasks = vec![Subtask::new("only".to_string()).unwrap()];
+        t.subtasks = vec![child];
+        app.tasks = vec![t];
+
+        app.focused = FocusedRow::Subtask(0, vec![0, 0]);
+        let vis = app.visible_indices();
+        app.delete_focused(&vis);
+
+        assert!(app.tasks[0].subtasks[0].subtasks.is_empty());
+        assert_eq!(
+            app.focused,
+            FocusedRow::Subtask(0, vec![0]),
+            "an emptied parent becomes the focus target"
+        );
+    }
+
+    #[test]
+    fn delete_on_empty_list_does_nothing() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks.clear();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        app.delete_focused(&vis);
+
+        assert!(app.tasks.is_empty());
+        assert!(app.status_msg.is_empty());
+        assert!(app.undo_stack.is_empty(), "no undo snapshot for a no-op");
+    }
+
+    // ── toggle_focused_status ──────────────────────────────────────────────
+
+    #[test]
+    fn toggle_task_status_cycles_pending_done_working_pending() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![Task::new("a".to_string()).unwrap()];
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].status, Status::Done);
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].status, Status::Working);
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].status, Status::Pending);
+    }
+
+    #[test]
+    fn toggle_subtask_status_cycles_between_pending_and_done() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        t.subtasks.push(Subtask::new("step".to_string()).unwrap());
+        app.tasks = vec![t];
+        app.focused = FocusedRow::Subtask(0, vec![0]);
+        let vis = app.visible_indices();
+
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].subtasks[0].status, crate::task::SubStatus::Done);
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].subtasks[0].status, crate::task::SubStatus::Pending);
+    }
+
+    #[test]
+    fn toggle_status_is_undoable() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![Task::new("a".to_string()).unwrap()];
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        app.toggle_focused_status(&vis);
+        app.undo();
+        assert_eq!(app.tasks[0].status, Status::Pending);
+    }
+
+    #[test]
+    fn toggle_status_respects_the_visible_index_mapping() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![
+            Task::new("alpha".to_string()).unwrap(),
+            Task::new("beta".to_string()).unwrap(),
+        ];
+        app.search_query = "beta".into();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+        assert_eq!(vis, vec![1]);
+
+        app.toggle_focused_status(&vis);
+        assert_eq!(app.tasks[0].status, Status::Pending, "hidden task untouched");
+        assert_eq!(app.tasks[1].status, Status::Done);
+    }
+
+    #[test]
+    fn toggle_task_status_out_of_range_is_a_noop() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks.clear();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        app.toggle_focused_status(&vis);
+
+        assert!(app.undo_stack.is_empty());
+        assert!(app.status_msg.is_empty());
+    }
+
+    // ── cycle_focused_priority ─────────────────────────────────────────────
+
+    #[test]
+    fn cycle_priority_rotates_high_medium_low() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![Task::new("a".to_string()).unwrap()];
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+        assert_eq!(app.tasks[0].priority, Priority::Medium);
+
+        app.cycle_focused_priority(&vis);
+        assert_eq!(app.tasks[0].priority, Priority::Low);
+        app.cycle_focused_priority(&vis);
+        assert_eq!(app.tasks[0].priority, Priority::High);
+        app.cycle_focused_priority(&vis);
+        assert_eq!(app.tasks[0].priority, Priority::Medium);
+
+        // Each step is undoable.
+        app.undo();
+        assert_eq!(app.tasks[0].priority, Priority::High);
+    }
+
+    #[test]
+    fn cycle_priority_ignores_subtask_rows() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        t.priority = Priority::High;
+        t.subtasks.push(Subtask::new("step".to_string()).unwrap());
+        app.tasks = vec![t];
+        app.focused = FocusedRow::Subtask(0, vec![0]);
+        let vis = app.visible_indices();
+
+        app.cycle_focused_priority(&vis);
+
+        assert_eq!(app.tasks[0].priority, Priority::High, "parent untouched");
+        assert!(app.undo_stack.is_empty(), "no-op must not push undo");
+    }
+
+    #[test]
+    fn cycle_priority_respects_the_visible_index_mapping() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![
+            Task::new("alpha".to_string()).unwrap(),
+            Task::new("beta".to_string()).unwrap(),
+        ];
+        app.search_query = "beta".into();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+        assert_eq!(vis, vec![1]);
+
+        app.cycle_focused_priority(&vis);
+
+        assert_eq!(app.tasks[0].priority, Priority::Medium, "hidden task untouched");
+        assert_eq!(app.tasks[1].priority, Priority::Low);
+    }
+
+    // ── add_subtask ────────────────────────────────────────────────────────
+
+    #[test]
+    fn add_subtask_under_focused_task_appends_top_level() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![Task::new("task".to_string()).unwrap()];
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        assert!(app.add_subtask(&vis, "step one"));
+
+        assert_eq!(app.tasks[0].subtasks.len(), 1);
+        assert_eq!(app.tasks[0].subtasks[0].description, "step one");
+        assert_eq!(app.status_msg, "Subtask added.");
+
+        app.undo();
+        assert!(app.tasks[0].subtasks.is_empty(), "adding must be undoable");
+    }
+
+    #[test]
+    fn add_subtask_under_focused_subtask_nests_a_child() {
+        let (mut app, _env) = app_in_temp_env();
+        let mut t = Task::new("task".to_string()).unwrap();
+        t.subtasks.push(Subtask::new("parent step".to_string()).unwrap());
+        app.tasks = vec![t];
+        app.focused = FocusedRow::Subtask(0, vec![0]);
+        let vis = app.visible_indices();
+
+        assert!(app.add_subtask(&vis, "child step"));
+
+        assert_eq!(app.tasks[0].subtasks.len(), 1, "no new top-level subtask");
+        assert_eq!(app.tasks[0].subtasks[0].subtasks.len(), 1);
+        assert_eq!(app.tasks[0].subtasks[0].subtasks[0].description, "child step");
+    }
+
+    #[test]
+    fn add_subtask_rejects_blank_text() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![Task::new("task".to_string()).unwrap()];
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        assert!(!app.add_subtask(&vis, "   "));
+
+        assert!(app.tasks[0].subtasks.is_empty());
+        assert_eq!(app.status_msg, "Subtask description cannot be empty.");
+        assert!(app.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn add_subtask_trims_and_respects_the_visible_index_mapping() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks = vec![
+            Task::new("alpha".to_string()).unwrap(),
+            Task::new("beta".to_string()).unwrap(),
+        ];
+        app.search_query = "beta".into();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+        assert_eq!(vis, vec![1]);
+
+        assert!(app.add_subtask(&vis, "  do it  "));
+
+        assert!(app.tasks[0].subtasks.is_empty(), "hidden task untouched");
+        assert_eq!(app.tasks[1].subtasks[0].description, "do it");
+    }
+
+    #[test]
+    fn add_subtask_without_a_visible_task_is_a_noop() {
+        let (mut app, _env) = app_in_temp_env();
+        app.tasks.clear();
+        app.focused = FocusedRow::Task(0);
+        let vis = app.visible_indices();
+
+        assert!(!app.add_subtask(&vis, "orphan"));
+
+        assert!(app.tasks.is_empty());
+        assert!(app.undo_stack.is_empty());
+        assert!(app.status_msg.is_empty());
     }
 }
