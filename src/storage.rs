@@ -562,4 +562,214 @@ mod tests {
         save_tasks_to(&[], path.to_str().unwrap()).unwrap();
         assert!(!path.exists());
     }
+
+    // ── roundtrip hardening ────────────────────────────────────────────────
+
+    // A task set that uses every field the markdown format can express.
+    fn rich_tasks() -> Vec<Task> {
+        let mut working =
+            Task::new("ship release #release due:2030-12-31 p:high".to_string()).unwrap();
+        working.status = Status::Working;
+        working.created_at = "2026-01-02".to_string();
+        let mut child = Subtask::new("write changelog".to_string()).unwrap();
+        child.status = SubStatus::Done;
+        let mut grand = Subtask::new("collect PRs".to_string()).unwrap();
+        grand.subtasks.push(Subtask::new("since last tag".to_string()).unwrap());
+        child.subtasks.push(grand);
+        working.subtasks.push(child);
+        working.subtasks.push(Subtask::new("tag and push".to_string()).unwrap());
+
+        // No created_at on purpose: the line must simply be omitted.
+        let mut pending = Task::new("triage inbox #admin".to_string()).unwrap();
+        pending.created_at.clear();
+
+        let mut done = Task::new("retire old flag #cleanup p:low".to_string()).unwrap();
+        done.status = Status::Done;
+        done.created_at = "2025-12-31".to_string();
+        done.subtasks.push(Subtask::new("removed".to_string()).unwrap());
+        done.subtasks[0].status = SubStatus::Done;
+
+        vec![working, pending, done]
+    }
+
+    #[test]
+    fn save_load_save_is_byte_identical() {
+        let dir = TempDir::new("grit-test-idempotent");
+        let first = dir.join("first.md");
+        let second = dir.join("second.md");
+
+        save_tasks_to(&rich_tasks(), first.to_str().unwrap()).unwrap();
+        let saved_once = fs::read_to_string(&first).unwrap();
+
+        let loaded = load_tasks_from(first.to_str().unwrap());
+        save_tasks_to(&loaded, second.to_str().unwrap()).unwrap();
+        let saved_twice = fs::read_to_string(&second).unwrap();
+
+        assert_eq!(
+            saved_once, saved_twice,
+            "a load/save cycle must not rewrite the file"
+        );
+        // The empty created_at produced no line: exactly two remain.
+        assert_eq!(
+            saved_once.matches("created:").count(),
+            2,
+            "file:\n{saved_once}"
+        );
+    }
+
+    #[test]
+    fn save_load_preserves_all_fields() {
+        let dir = TempDir::new("grit-test-all-fields");
+        let path = dir.join("tasks.md");
+        save_tasks_to(&rich_tasks(), path.to_str().unwrap()).unwrap();
+
+        let loaded = load_tasks_from(path.to_str().unwrap());
+        assert_eq!(loaded.len(), 3);
+
+        let w = &loaded[0];
+        assert_eq!(w.description, "ship release");
+        assert_eq!(w.status, Status::Working);
+        assert_eq!(w.priority, Priority::High);
+        assert_eq!(w.tags, vec!["release"]);
+        assert_eq!(w.due_date.as_deref(), Some("2030-12-31"));
+        assert_eq!(w.created_at, "2026-01-02");
+        assert_eq!(w.subtasks.len(), 2);
+        assert_eq!(w.subtasks[0].description, "write changelog");
+        assert_eq!(w.subtasks[0].status, SubStatus::Done);
+        assert_eq!(w.subtasks[0].subtasks[0].description, "collect PRs");
+        assert_eq!(
+            w.subtasks[0].subtasks[0].subtasks[0].description,
+            "since last tag"
+        );
+
+        let p = &loaded[1];
+        assert_eq!(p.description, "triage inbox");
+        assert_eq!(p.status, Status::Pending);
+        assert_eq!(p.priority, Priority::Medium);
+        assert_eq!(p.tags, vec!["admin"]);
+        assert_eq!(p.due_date, None);
+        assert_eq!(p.created_at, "");
+
+        let d = &loaded[2];
+        assert_eq!(d.description, "retire old flag");
+        assert_eq!(d.status, Status::Done);
+        assert_eq!(d.priority, Priority::Low);
+        assert_eq!(d.subtasks[0].status, SubStatus::Done);
+    }
+
+    #[test]
+    fn descriptions_that_look_like_markdown_roundtrip() {
+        let dir = TempDir::new("grit-test-lookalike");
+        let path = dir.join("tasks.md");
+
+        // Task::new keeps these verbatim: no tag/due/priority words in them.
+        let task_descs = [
+            "- [ ] looks like a task",
+            "- [x] looks done",
+            "- plain bullet",
+            "[ ] bracket first",
+        ];
+        let mut tasks: Vec<Task> = task_descs
+            .iter()
+            .map(|d| Task::new(d.to_string()).unwrap())
+            .collect();
+        // A subtask description is never re-parsed for metadata, so this one
+        // may even look like a header or carry a hash word.
+        let mut parent = Task::new("parent".to_string()).unwrap();
+        for d in ["- [ ] nested-looking", "- plain nested", "## header-like", "#hash-like"] {
+            parent.subtasks.push(Subtask::new(d.to_string()).unwrap());
+        }
+        tasks.push(parent);
+
+        save_tasks_to(&tasks, path.to_str().unwrap()).unwrap();
+        let loaded = load_tasks_from(path.to_str().unwrap());
+
+        assert_eq!(loaded.len(), 5);
+        for (task, expected) in loaded.iter().zip(task_descs) {
+            assert_eq!(task.description, expected);
+            assert_eq!(task.status, Status::Pending, "marker must stay pending");
+            assert!(task.subtasks.is_empty(), "no phantom subtasks for {expected:?}");
+        }
+        let subs: Vec<&str> = loaded[4]
+            .subtasks
+            .iter()
+            .map(|s| s.description.as_str())
+            .collect();
+        assert_eq!(
+            subs,
+            vec!["- [ ] nested-looking", "- plain nested", "## header-like", "#hash-like"]
+        );
+    }
+
+    #[test]
+    fn created_text_inside_descriptions_roundtrips() {
+        let dir = TempDir::new("grit-test-created-text");
+        let path = dir.join("tasks.md");
+
+        // "created:" mid-sentence, at the start of a description, and on a
+        // subtask line must never be mistaken for the metadata line.
+        let mut mid = Task::new("migrated created: long ago".to_string()).unwrap();
+        mid.created_at = "2026-03-04".to_string();
+        let mut start = Task::new("created: fake".to_string()).unwrap();
+        start.created_at = "2026-05-06".to_string();
+        let mut no_meta = Task::new("created: nothing follows".to_string()).unwrap();
+        no_meta.created_at = String::new();
+        let mut parent = Task::new("parent".to_string()).unwrap();
+        parent.subtasks.push(Subtask::new("created: fake step".to_string()).unwrap());
+
+        save_tasks_to(&[mid, start, no_meta, parent], path.to_str().unwrap()).unwrap();
+        let loaded = load_tasks_from(path.to_str().unwrap());
+
+        assert_eq!(loaded[0].description, "migrated created: long ago");
+        assert_eq!(loaded[0].created_at, "2026-03-04");
+        assert_eq!(loaded[1].description, "created: fake");
+        assert_eq!(loaded[1].created_at, "2026-05-06");
+        assert_eq!(loaded[2].description, "created: nothing follows");
+        assert_eq!(loaded[2].created_at, "");
+        assert_eq!(loaded[3].subtasks[0].description, "created: fake step");
+    }
+
+    #[test]
+    fn unicode_descriptions_tags_and_subtasks_roundtrip() {
+        let dir = TempDir::new("grit-test-unicode");
+        let path = dir.join("tasks.md");
+
+        let mut t = Task::new(
+            "修复登录 🐛 #バグ #修复 due:2030-01-01 p:low".to_string(),
+        )
+        .unwrap();
+        t.created_at = "2026-02-03".to_string();
+        t.subtasks.push(Subtask::new("检查 ✅ テスト".to_string()).unwrap());
+        t.subtasks.push(Subtask::new("family 👨‍👩‍👧‍👦".to_string()).unwrap());
+
+        save_tasks_to(&[t], path.to_str().unwrap()).unwrap();
+        let loaded = load_tasks_from(path.to_str().unwrap());
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].description, "修复登录 🐛");
+        assert_eq!(loaded[0].tags, vec!["バグ", "修复"]);
+        assert_eq!(loaded[0].due_date.as_deref(), Some("2030-01-01"));
+        assert_eq!(loaded[0].priority, Priority::Low);
+        assert_eq!(loaded[0].created_at, "2026-02-03");
+        assert_eq!(loaded[0].subtasks[0].description, "检查 ✅ テスト");
+        assert_eq!(loaded[0].subtasks[1].description, "family 👨‍👩‍👧‍👦");
+    }
+
+    #[test]
+    fn tag_order_and_duplicates_survive_a_roundtrip() {
+        let dir = TempDir::new("grit-test-tag-order");
+        let path = dir.join("tasks.md");
+
+        let t = Task::new("dupes #b #a #b #A".to_string()).unwrap();
+        assert_eq!(t.tags, vec!["b", "a", "b", "A"]);
+
+        save_tasks_to(&[t], path.to_str().unwrap()).unwrap();
+        let loaded = load_tasks_from(path.to_str().unwrap());
+
+        assert_eq!(
+            loaded[0].tags,
+            vec!["b", "a", "b", "A"],
+            "order, duplicates and case must be preserved"
+        );
+    }
 }

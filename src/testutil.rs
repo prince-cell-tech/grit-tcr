@@ -70,6 +70,19 @@ impl TestEnv {
     pub fn dir(&self) -> &Path {
         self.dir.path()
     }
+
+    // The directory the process was in before the switch.
+    pub fn original(&self) -> &Path {
+        &self.original
+    }
+
+    // Restore the original cwd now, without releasing the cwd lock. Tests that
+    // assert on the restored state use this to avoid racing other cwd-switching
+    // tests; Drop restores it anyway.
+    pub fn restore_cwd(&mut self) {
+        std::env::set_current_dir(&self.original)
+            .unwrap_or_else(|e| panic!("failed to restore cwd to {}: {e}", self.original.display()));
+    }
 }
 
 impl Drop for TestEnv {
@@ -125,15 +138,16 @@ mod tests {
     }
 
     #[test]
-    fn test_env_changes_cwd_and_restores_it_on_drop() {
-        let original = std::env::current_dir().unwrap();
+    fn test_env_changes_cwd_and_restores_it() {
+        let mut env = TestEnv::new("grit-test-env");
+        let original = env.original().to_path_buf();
 
-        {
-            let env = TestEnv::new("grit-test-env");
-            assert_eq!(std::env::current_dir().unwrap(), env.dir());
-            assert_ne!(std::env::current_dir().unwrap(), original);
-        }
+        assert_eq!(std::env::current_dir().unwrap(), env.dir());
+        assert_ne!(std::env::current_dir().unwrap(), original);
 
+        // Assert while the cwd lock is still held: after Drop another test may
+        // legitimately chdir, so a post-drop assertion would race.
+        env.restore_cwd();
         assert_eq!(std::env::current_dir().unwrap(), original, "cwd must be restored");
     }
 
